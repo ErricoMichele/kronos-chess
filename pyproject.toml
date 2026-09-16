@@ -20,3 +20,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "slow: perft depth 5-6 reference positions (architecture.md §14); excluded by default, run with `pytest -m slow`",
+]
+addopts = "-m 'not slow'"
