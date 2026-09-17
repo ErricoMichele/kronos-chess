@@ -33,7 +33,7 @@ time control.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from chessengine.board import Board
 from chessengine.constants import BLACK, WHITE
@@ -171,6 +171,67 @@ def play_match(
             black_evaluator = evaluator_b if a_plays_white else evaluator_a
             white_search = Search(white_evaluator)
             black_search = Search(black_evaluator)
+
+            outcome = play_game(white_search, black_search, board, limits, ply_cap)
+
+            white_score, black_score = _RESULT_SCORES[outcome]
+            a_score, b_score = (
+                (white_score, black_score) if a_plays_white else (black_score, white_score)
+            )
+            result.score_a += a_score
+            result.score_b += b_score
+            result.games.append(
+                {
+                    "fen": fen,
+                    "white": "a" if a_plays_white else "b",
+                    "result": outcome,
+                }
+            )
+    return result
+
+
+# --- Full match: two Search configurations, same evaluator ------------------
+
+
+def play_match_searches(
+    search_factory_a: Callable[[], Search],
+    search_factory_b: Callable[[], Search],
+    positions: list[str],
+    limits: SearchLimits,
+    ply_cap: int = 200,
+) -> MatchResult:
+    """Like `play_match`, but for gating a *search* extension (null-move
+    pruning, LMR, aspiration windows, check extensions, ...) rather than an
+    evaluation term.
+
+    `play_match` always builds `Search(evaluator)` itself, so it can only
+    ever vary the evaluator between engine A and engine B -- it has no way
+    to hand engine A and engine B *different search behaviour* on top of
+    the same evaluator. `search_factory_a`/`search_factory_b` are zero-arg
+    callables that each construct and return a fresh `Search` (e.g. a plain
+    `Search(default_evaluator())` for the baseline vs. a subclass or
+    monkeypatched variant with the extension's cutoff disabled for the
+    comparison), so the two engines can differ in search logic alone.
+
+    A fresh Search is built (via the matching factory) for each color in
+    each game -- same no-state-leakage guarantee as `play_match` -- so
+    callers should *not* reuse one long-lived Search instance across
+    factory calls if they rely on a fresh TT/killers/history per game.
+
+    Per architecture.md §15, a search extension whose whole point is
+    searching deeper in the same wall-clock time (e.g. null-move pruning)
+    must be compared at *equal time per move*, not equal depth -- so
+    `limits` here is expected to carry `movetime_ms`, not (only) a fixed
+    `max_depth` the way the evaluation-term gates use.
+    """
+    result = MatchResult()
+    for fen in positions:
+        for a_plays_white in (True, False):
+            board = parse_fen(fen)
+            white_factory = search_factory_a if a_plays_white else search_factory_b
+            black_factory = search_factory_b if a_plays_white else search_factory_a
+            white_search = white_factory()
+            black_search = black_factory()
 
             outcome = play_game(white_search, black_search, board, limits, ply_cap)
 

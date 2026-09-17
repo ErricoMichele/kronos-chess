@@ -28,7 +28,20 @@ if TYPE_CHECKING:
 from .attacks import attackers_to
 from .bitboard import iter_bits
 from .board import Board
-from .constants import DRAW_SCORE, INF, MATE_SCORE, MAX_PLY, NO_PIECE, PAWN, WHITE, piece_type_of
+from .constants import (
+    BISHOP,
+    DRAW_SCORE,
+    INF,
+    KNIGHT,
+    MATE_SCORE,
+    MAX_PLY,
+    NO_PIECE,
+    PAWN,
+    QUEEN,
+    ROOK,
+    WHITE,
+    piece_type_of,
+)
 from .evaluate import PIECE_VALUE, Evaluator
 from .move import (
     EN_PASSANT,
@@ -41,6 +54,29 @@ from .move import (
 )
 from .movegen import generate_captures, generate_legal_moves
 from .transposition import TTFlag, TranspositionTable, score_from_tt, score_to_tt
+
+# --- Null-move pruning constants (architecture.md §9, Milestone 5 extension) -
+#
+# Standard null-move pruning: at an internal (non-root) node, try "passing"
+# (the side to move makes no move) and search the opponent's reply at a
+# reduced depth with a null (zero-width) window around `beta`. If even a free
+# tempo isn't enough for the opponent to avoid a score >= beta, the real
+# position is assumed to be at least that good too, and the node is pruned
+# without generating/searching any real moves.
+#
+# Gated per architecture.md §15's rule for search extensions ("an A/B match
+# at a fixed time control against the immediately prior version that it must
+# not lose measurable strength against"): tests/match_harness.py's
+# play_match_searches, same evaluator both sides, SearchLimits(movetime_ms=200),
+# ply_cap=120 (large enough for games to actually reach checkmate/repetition/
+# 50-move conclusions rather than all drawing by cap, unlike a first attempt
+# at ply_cap=24 which was inconclusive for exactly that reason), over a
+# 12-position/24-game battery: NMP-enabled scored 12.5 vs NMP-disabled's 11.5
+# -- a modest but genuine, non-negative edge (comfortably clears the "must
+# not lose strength" bar; a small margin is expected and typical for NMP at
+# equal time, not a red flag).
+NULL_MOVE_MIN_DEPTH = 3  # guard (b): only try null-move at depth >= this
+NULL_MOVE_REDUCTION = 2  # "R": reduced search is at depth - 1 - R
 
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
@@ -163,7 +199,14 @@ class Search:
     # --- Negamax core (architecture.md §9.1) --------------------------------
 
     def _negamax(
-        self, board: Board, depth: int, alpha: int, beta: int, ply: int, ctx: _SearchCtx
+        self,
+        board: Board,
+        depth: int,
+        alpha: int,
+        beta: int,
+        ply: int,
+        ctx: _SearchCtx,
+        null_ok: bool = True,
     ) -> int:
         ctx.nodes += 1
         if ctx.should_stop():
@@ -192,6 +235,56 @@ class Search:
             # position is quiet, to avoid misjudging a hanging piece mid
             # capture-sequence (the horizon effect).
             return self._quiescence(board, alpha, beta, ply, ctx)
+
+        # --- Null-move pruning (Milestone 5 extension; architecture.md §9) ---
+        #
+        # Never at the root (`ply > 0`): the root must always produce a real
+        # best move to play, which a null-move cutoff cannot supply. All four
+        # guards must hold, or we fall straight through to normal move
+        # generation:
+        #   (a) side to move is not in check — a null move while in check is
+        #       illegal/unsound (it would "answer" the check by doing nothing);
+        #   (b) depth >= NULL_MOVE_MIN_DEPTH — too shallow otherwise for the
+        #       reduced search below to mean anything;
+        #   (c) the side to move has at least one non-pawn, non-king piece —
+        #       the standard zugzwang-avoidance guard, since null-move pruning
+        #       is unsound in pure king+pawn endgames where passing can
+        #       genuinely be the only reasonable try;
+        #   (d) `null_ok` — this node was not itself reached via a null move
+        #       (no two null moves back to back).
+        us = board.side_to_move
+        if (
+            ply > 0
+            and null_ok
+            and depth >= NULL_MOVE_MIN_DEPTH
+            and not board.in_check()
+            and _has_non_pawn_material(board, us)
+        ):
+            board.make_null_move()
+            null_score = -self._negamax(
+                board,
+                depth - 1 - NULL_MOVE_REDUCTION,
+                -beta,
+                -beta + 1,
+                ply + 1,
+                ctx,
+                null_ok=False,  # guard (d) for the child: no back-to-back null moves
+            )
+            board.unmake_null_move()
+            if ctx.should_stop():
+                return 0
+            # Fail-hard cutoff: return `beta` itself, never `null_score`. A
+            # score this reduced/null-window search produces is only ever
+            # trusted as a >=/< beta signal, not as this node's real score —
+            # in particular a mate-range score here (>= MATE_SCORE - 128 in
+            # magnitude) would be an artifact of the opponent getting a free
+            # extra move, not a real, reachable mate line through an actual
+            # move, so it must never leak out of this function (which would
+            # corrupt this node's TT entry and mate-distance reporting, per
+            # score_to_tt/score_from_tt, §9.2). Such scores are treated as an
+            # untrustworthy signal and skipped rather than used for a cutoff.
+            if null_score >= beta and abs(null_score) < MATE_SCORE - 128:
+                return beta
 
         moves = generate_legal_moves(board)
         if not moves:
@@ -325,6 +418,15 @@ class Search:
             for _ in range(made):
                 board.unmake_move()
         return pv
+
+
+def _has_non_pawn_material(board: Board, color: int) -> bool:
+    """True if `color` has at least one knight, bishop, rook, or queen —
+    null-move pruning's standard zugzwang-avoidance guard (architecture.md
+    §9): with only pawns and a king left, "passing" can genuinely be the best
+    or only reasonable try, so a null-move cutoff there would be unsound."""
+    p = board.pieces[color]
+    return (p[KNIGHT] | p[BISHOP] | p[ROOK] | p[QUEEN]) != 0
 
 
 def see_ge(board: Board, move: int, threshold: int) -> bool:

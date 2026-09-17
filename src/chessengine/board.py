@@ -122,6 +122,7 @@ class Board:
         "history",
         "position_history",
         "material_pst_score",
+        "null_move_history",
     )
 
     def __init__(self) -> None:
@@ -138,6 +139,11 @@ class Board:
         self.history: list[UndoInfo] = []
         self.position_history: list[int] = []  # hashes seen, for repetition
         self.material_pst_score: int = 0  # White's PIECE_VALUE+PST total minus Black's (§10.1)
+        # Dedicated undo stack for make_null_move/unmake_null_move (§6), kept
+        # fully separate from `history`/`UndoInfo` so null-move bookkeeping
+        # can never disturb the already-perft-verified real move machinery.
+        # Each entry is (ep_square_before, zobrist_hash_before).
+        self.null_move_history: list[tuple[int | None, int]] = []
 
     @staticmethod
     def starting_position() -> "Board":
@@ -253,6 +259,54 @@ class Board:
         self.material_pst_score = undo.material_pst_score
         if us == BLACK:
             self.fullmove_number -= 1
+
+    # --- Null move (search-internal only, §15) -----------------------------
+    #
+    # A "null move" passes the turn without moving any piece — it exists
+    # purely for search's null-move pruning and must never be used during
+    # real game play (it is not a legal chess move). It therefore gets its
+    # own tiny, dedicated undo stack (`null_move_history`) instead of
+    # `history`/`UndoInfo`: real moves and null moves are bookkept through
+    # completely separate code paths, so a null-move bug can never corrupt
+    # the already-perft-verified real make_move/unmake_move machinery, and
+    # vice versa.
+
+    def make_null_move(self) -> None:
+        """Pass the turn with no piece moved.
+
+        Only `side_to_move`, `ep_square`, and the corresponding components of
+        `zobrist_hash` change — mirroring exactly what a real move does to
+        those fields when en passant expires and the side to move flips.
+        `pieces`/`occupied_co`/`occupied`/`mailbox`/`castling_rights`/
+        `material_pst_score` are untouched, since nothing moved.
+
+        `halfmove_clock` is deliberately left unincremented. A null move is
+        neither a pawn move nor a capture, so incrementing it would be
+        modeling something that didn't happen; and since this method is
+        search-internal only (always paired with `unmake_null_move` before
+        control returns to anything that could act on a real fifty-move
+        draw), there is no observable difference either way. We choose not
+        to touch it at all, the simplest option that keeps this method's
+        contract to "only side/ep/hash change."
+
+        Does not push onto `position_history`: the resulting position is a
+        search-internal fiction never actually reached in the game, so it
+        must never feed repetition detection.
+        """
+        self.null_move_history.append((self.ep_square, self.zobrist_hash))
+        if self.ep_square is not None:
+            self.zobrist_hash ^= ZOBRIST_EP_FILE[file_of(self.ep_square)]
+            self.ep_square = None
+        self.side_to_move = 1 - self.side_to_move
+        self.zobrist_hash ^= ZOBRIST_SIDE
+
+    def unmake_null_move(self) -> None:
+        """Undo the most recent `make_null_move`, restoring `side_to_move`,
+        `ep_square`, and `zobrist_hash` exactly (the only fields it changed)."""
+        ep_square_before, zobrist_hash_before = self.null_move_history.pop()
+        self.side_to_move = 1 - self.side_to_move
+        self.ep_square = ep_square_before
+        self.zobrist_hash = zobrist_hash_before
 
     # --- Private single-writer helpers (§6) --------------------------------
     #
