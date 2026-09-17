@@ -21,14 +21,22 @@ from .bitboard import iter_bits, popcount
 from .board import Board
 from .constants import (
     BISHOP,
+    BISHOP_PST,
     BLACK,
     FILE_MASK,
     KING,
+    KING_PST,
     KNIGHT,
+    KNIGHT_PST,
     PAWN,
+    PAWN_PST,
+    PIECE_VALUE,
+    PST,
     QUEEN,
+    QUEEN_PST,
     RANK_MASK,
     ROOK,
+    ROOK_PST,
     WHITE,
     file_of,
     rank_of,
@@ -47,99 +55,21 @@ TermFn = Callable[[Board], int]  # a pure evaluation term, side-to-move-relative
 
 # --- 10.1 Material + PST (the only enabled term through Milestone 4) --------
 #
-# Material values in centipawns, plus one 64-entry piece-square table (PST)
-# per piece type, defined from White's point of view with index 0 = a1 and
-# index 63 = h8 (matching board indexing, §3.1); Black's lookup mirrors the
-# square vertically via `sq ^ 56` (flips the rank, keeps the file) instead of
-# maintaining a second table.
-#
-# The row order below runs **rank 1 to rank 8, top to bottom**, matching
-# a1=0 indexing — the opposite of how these tables are usually printed in
-# chess references (rank 8 first). Transcribing a reference table's printed
-# row order directly into an a1=0 array is a classic off-by-mirror bug (it
-# rewards White's pawns for sitting on their *starting* rank instead of
-# their promotion rank); each table below has been reversed from its
-# conventional rank-8-first printing into rank-1-first order.
-
-PIECE_VALUE = {PAWN: 100, KNIGHT: 320, BISHOP: 330, ROOK: 500, QUEEN: 900, KING: 0}
-
-PAWN_PST = (
-      0,   0,   0,   0,   0,   0,   0,   0,   # rank 1
-      5,  10,  10, -20, -20,  10,  10,   5,   # rank 2 (starting rank)
-      5,  -5, -10,   0,   0, -10,  -5,   5,   # rank 3
-      0,   0,   0,  20,  20,   0,   0,   0,   # rank 4
-      5,   5,  10,  25,  25,  10,   5,   5,   # rank 5
-     10,  10,  20,  30,  30,  20,  10,  10,   # rank 6
-     50,  50,  50,  50,  50,  50,  50,  50,   # rank 7 (one step from promotion)
-      0,   0,   0,   0,   0,   0,   0,   0,   # rank 8
-)
-
-KNIGHT_PST = (
-    -50, -40, -30, -30, -30, -30, -40, -50,   # rank 1
-    -40, -20,   0,   5,   5,   0, -20, -40,   # rank 2
-    -30,   5,  10,  15,  15,  10,   5, -30,   # rank 3
-    -30,   0,  15,  20,  20,  15,   0, -30,   # rank 4
-    -30,   5,  15,  20,  20,  15,   5, -30,   # rank 5
-    -30,   0,  10,  15,  15,  10,   0, -30,   # rank 6
-    -40, -20,   0,   0,   0,   0, -20, -40,   # rank 7
-    -50, -40, -30, -30, -30, -30, -40, -50,   # rank 8
-)
-
-BISHOP_PST = (
-    -20, -10, -10, -10, -10, -10, -10, -20,   # rank 1
-    -10,   5,   0,   0,   0,   0,   5, -10,   # rank 2
-    -10,  10,  10,  10,  10,  10,  10, -10,   # rank 3
-    -10,   0,  10,  10,  10,  10,   0, -10,   # rank 4
-    -10,   5,   5,  10,  10,   5,   5, -10,   # rank 5
-    -10,   0,   5,  10,  10,   5,   0, -10,   # rank 6
-    -10,   0,   0,   0,   0,   0,   0, -10,   # rank 7
-    -20, -10, -10, -10, -10, -10, -10, -20,   # rank 8
-)
-
-ROOK_PST = (
-      0,   0,   0,   5,   5,   0,   0,   0,   # rank 1
-     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 2
-     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 3
-     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 4
-     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 5
-     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 6
-      5,  10,  10,  10,  10,  10,  10,   5,   # rank 7
-      0,   0,   0,   0,   0,   0,   0,   0,   # rank 8
-)
-
-QUEEN_PST = (
-    -20, -10, -10,  -5,  -5, -10, -10, -20,   # rank 1
-    -10,   0,   5,   0,   0,   0,   0, -10,   # rank 2
-    -10,   5,   5,   5,   5,   5,   0, -10,   # rank 3
-      0,   0,   5,   5,   5,   5,   0,  -5,   # rank 4
-     -5,   0,   5,   5,   5,   5,   0,  -5,   # rank 5
-    -10,   0,   5,   5,   5,   5,   0, -10,   # rank 6
-    -10,   0,   0,   0,   0,   0,   0, -10,   # rank 7
-    -20, -10, -10,  -5,  -5, -10, -10, -20,   # rank 8
-)
-
-KING_PST = (
-     20,  30,  10,   0,   0,  10,  30,  20,   # rank 1
-     20,  20,   0,   0,   0,   0,  20,  20,   # rank 2
-    -10, -20, -20, -20, -20, -20, -20, -10,   # rank 3
-    -20, -30, -30, -40, -40, -30, -30, -20,   # rank 4
-    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 5
-    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 6
-    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 7
-    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 8
-)
-
-PST = {
-    PAWN: PAWN_PST,
-    KNIGHT: KNIGHT_PST,
-    BISHOP: BISHOP_PST,
-    ROOK: ROOK_PST,
-    QUEEN: QUEEN_PST,
-    KING: KING_PST,
-}
+# PIECE_VALUE/PAWN_PST/KNIGHT_PST/BISHOP_PST/ROOK_PST/QUEEN_PST/KING_PST/PST
+# live in constants.py (not here) so board.py's make_move/unmake_move hot
+# path can read them for the incremental `material_pst_score` running total
+# (architecture.md §10.1's closing note) without board.py depending on
+# evaluate.py, which would invert the module DAG (§11). Re-imported here
+# (see the `from .constants import (...)` above) purely so existing
+# `from chessengine.evaluate import KNIGHT_PST`-style call sites (e.g.
+# tests/test_evaluate.py) keep working unchanged.
 
 
 def _side_score(board: Board, color: int) -> int:
+    """From-scratch total, independent of `board.material_pst_score`'s
+    incremental bookkeeping. Kept as the differential-test oracle for the
+    incremental running total (architecture.md §10.1's closing note) — never
+    called from `material_pst_term` itself any more."""
     score, mirror = 0, color == BLACK
     for ptype in range(6):
         table = PST[ptype]
@@ -149,8 +79,11 @@ def _side_score(board: Board, color: int) -> int:
 
 
 def material_pst_term(board: Board) -> int:
-    white_score = _side_score(board, WHITE) - _side_score(board, BLACK)
-    return white_score if board.side_to_move == WHITE else -white_score
+    """O(1) read of the incremental running total `board.py` maintains
+    inside `_add_piece`/`_remove_piece` (architecture.md §10.1's closing
+    note) — same White-relative-then-negamax-flipped contract `_side_score`
+    used to compute from scratch every call."""
+    return board.material_pst_score if board.side_to_move == WHITE else -board.material_pst_score
 
 
 # --- Mobility (Milestone 5, enabled via Weights.mobility after its A/B gate) -

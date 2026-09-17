@@ -75,3 +75,103 @@ MAX_PLY = 128
 INF = 1_000_000
 MATE_SCORE = 100_000
 DRAW_SCORE = 0
+
+# --- Material + PST evaluation data (architecture.md §10.1) ------------------
+#
+# Material values in centipawns, plus one 64-entry piece-square table (PST)
+# per piece type, defined from White's point of view with index 0 = a1 and
+# index 63 = h8 (matching board indexing, §3.1); Black's lookup mirrors the
+# square vertically via `sq ^ 56` (flips the rank, keeps the file) instead of
+# maintaining a second table.
+#
+# The row order below runs **rank 1 to rank 8, top to bottom**, matching
+# a1=0 indexing — the opposite of how these tables are usually printed in
+# chess references (rank 8 first). Transcribing a reference table's printed
+# row order directly into an a1=0 array is a classic off-by-mirror bug (it
+# rewards White's pawns for sitting on their *starting* rank instead of
+# their promotion rank); each table below has been reversed from its
+# conventional rank-8-first printing into rank-1-first order.
+#
+# Homed here (rather than in evaluate.py) so board.py's make_move/unmake_move
+# hot path can read them for the incremental `material_pst_score` running
+# total (architecture.md §10.1's closing note) without board.py depending on
+# evaluate.py, which would invert the module DAG (§11). evaluate.py
+# re-imports these same names so existing `from chessengine.evaluate import
+# ...` call sites keep working unchanged.
+
+PIECE_VALUE = {PAWN: 100, KNIGHT: 320, BISHOP: 330, ROOK: 500, QUEEN: 900, KING: 0}
+
+PAWN_PST = (
+      0,   0,   0,   0,   0,   0,   0,   0,   # rank 1
+      5,  10,  10, -20, -20,  10,  10,   5,   # rank 2 (starting rank)
+      5,  -5, -10,   0,   0, -10,  -5,   5,   # rank 3
+      0,   0,   0,  20,  20,   0,   0,   0,   # rank 4
+      5,   5,  10,  25,  25,  10,   5,   5,   # rank 5
+     10,  10,  20,  30,  30,  20,  10,  10,   # rank 6
+     50,  50,  50,  50,  50,  50,  50,  50,   # rank 7 (one step from promotion)
+      0,   0,   0,   0,   0,   0,   0,   0,   # rank 8
+)
+
+KNIGHT_PST = (
+    -50, -40, -30, -30, -30, -30, -40, -50,   # rank 1
+    -40, -20,   0,   5,   5,   0, -20, -40,   # rank 2
+    -30,   5,  10,  15,  15,  10,   5, -30,   # rank 3
+    -30,   0,  15,  20,  20,  15,   0, -30,   # rank 4
+    -30,   5,  15,  20,  20,  15,   5, -30,   # rank 5
+    -30,   0,  10,  15,  15,  10,   0, -30,   # rank 6
+    -40, -20,   0,   0,   0,   0, -20, -40,   # rank 7
+    -50, -40, -30, -30, -30, -30, -40, -50,   # rank 8
+)
+
+BISHOP_PST = (
+    -20, -10, -10, -10, -10, -10, -10, -20,   # rank 1
+    -10,   5,   0,   0,   0,   0,   5, -10,   # rank 2
+    -10,  10,  10,  10,  10,  10,  10, -10,   # rank 3
+    -10,   0,  10,  10,  10,  10,   0, -10,   # rank 4
+    -10,   5,   5,  10,  10,   5,   5, -10,   # rank 5
+    -10,   0,   5,  10,  10,   5,   0, -10,   # rank 6
+    -10,   0,   0,   0,   0,   0,   0, -10,   # rank 7
+    -20, -10, -10, -10, -10, -10, -10, -20,   # rank 8
+)
+
+ROOK_PST = (
+      0,   0,   0,   5,   5,   0,   0,   0,   # rank 1
+     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 2
+     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 3
+     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 4
+     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 5
+     -5,   0,   0,   0,   0,   0,   0,  -5,   # rank 6
+      5,  10,  10,  10,  10,  10,  10,   5,   # rank 7
+      0,   0,   0,   0,   0,   0,   0,   0,   # rank 8
+)
+
+QUEEN_PST = (
+    -20, -10, -10,  -5,  -5, -10, -10, -20,   # rank 1
+    -10,   0,   5,   0,   0,   0,   0, -10,   # rank 2
+    -10,   5,   5,   5,   5,   5,   0, -10,   # rank 3
+      0,   0,   5,   5,   5,   5,   0,  -5,   # rank 4
+     -5,   0,   5,   5,   5,   5,   0,  -5,   # rank 5
+    -10,   0,   5,   5,   5,   5,   0, -10,   # rank 6
+    -10,   0,   0,   0,   0,   0,   0, -10,   # rank 7
+    -20, -10, -10,  -5,  -5, -10, -10, -20,   # rank 8
+)
+
+KING_PST = (
+     20,  30,  10,   0,   0,  10,  30,  20,   # rank 1
+     20,  20,   0,   0,   0,   0,  20,  20,   # rank 2
+    -10, -20, -20, -20, -20, -20, -20, -10,   # rank 3
+    -20, -30, -30, -40, -40, -30, -30, -20,   # rank 4
+    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 5
+    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 6
+    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 7
+    -30, -40, -40, -50, -50, -40, -40, -30,   # rank 8
+)
+
+PST = {
+    PAWN: PAWN_PST,
+    KNIGHT: KNIGHT_PST,
+    BISHOP: BISHOP_PST,
+    ROOK: ROOK_PST,
+    QUEEN: QUEEN_PST,
+    KING: KING_PST,
+}

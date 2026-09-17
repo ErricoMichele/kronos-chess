@@ -42,6 +42,8 @@ from .constants import (
     KING,
     NO_PIECE,
     PAWN,
+    PIECE_VALUE,
+    PST,
     ROOK,
     WHITE,
     color_of,
@@ -102,6 +104,7 @@ class UndoInfo:
     ep_square: int | None  # en-passant target square *before* this move
     halfmove_clock: int  # 50-move counter *before* this move
     zobrist_hash: int  # full hash *before* this move
+    material_pst_score: int  # White-relative material+PST total *before* this move
 
 
 class Board:
@@ -118,6 +121,7 @@ class Board:
         "zobrist_hash",
         "history",
         "position_history",
+        "material_pst_score",
     )
 
     def __init__(self) -> None:
@@ -133,6 +137,7 @@ class Board:
         self.zobrist_hash: int = 0
         self.history: list[UndoInfo] = []
         self.position_history: list[int] = []  # hashes seen, for repetition
+        self.material_pst_score: int = 0  # White's PIECE_VALUE+PST total minus Black's (§10.1)
 
     @staticmethod
     def starting_position() -> "Board":
@@ -186,6 +191,7 @@ class Board:
                 self.ep_square,
                 self.halfmove_clock,
                 self.zobrist_hash,
+                self.material_pst_score,
             )
         )
 
@@ -244,14 +250,16 @@ class Board:
         self.ep_square = undo.ep_square
         self.halfmove_clock = undo.halfmove_clock
         self.zobrist_hash = undo.zobrist_hash
+        self.material_pst_score = undo.material_pst_score
         if us == BLACK:
             self.fullmove_number -= 1
 
     # --- Private single-writer helpers (§6) --------------------------------
     #
     # These are the *only* places `pieces`, `occupied_co`, `occupied`,
-    # `mailbox`, and the piece-square component of `zobrist_hash` are ever
-    # mutated, which is what keeps the invariants in §13 checkable.
+    # `mailbox`, the piece-square component of `zobrist_hash`, and
+    # `material_pst_score` are ever mutated, which is what keeps the
+    # invariants in §13 checkable.
 
     def _add_piece(self, piece_code: int, sq: int) -> None:
         color, ptype, bit = color_of(piece_code), piece_type_of(piece_code), 1 << sq
@@ -260,6 +268,8 @@ class Board:
         self.occupied |= bit
         self.mailbox[sq] = piece_code
         self.zobrist_hash ^= ZOBRIST_PIECE[color][ptype][sq]
+        contribution = PIECE_VALUE[ptype] + (PST[ptype][sq ^ 56] if color == BLACK else PST[ptype][sq])
+        self.material_pst_score += contribution if color == WHITE else -contribution
 
     def _remove_piece(self, piece_code: int, sq: int) -> None:
         color, ptype, bit = color_of(piece_code), piece_type_of(piece_code), 1 << sq
@@ -268,6 +278,8 @@ class Board:
         self.occupied &= ~bit
         self.mailbox[sq] = NO_PIECE
         self.zobrist_hash ^= ZOBRIST_PIECE[color][ptype][sq]
+        contribution = PIECE_VALUE[ptype] + (PST[ptype][sq ^ 56] if color == BLACK else PST[ptype][sq])
+        self.material_pst_score -= contribution if color == WHITE else -contribution
 
     def _move_piece(self, piece_code: int, frm: int, to: int) -> None:
         self._remove_piece(piece_code, frm)
