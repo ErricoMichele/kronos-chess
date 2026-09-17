@@ -1,10 +1,16 @@
 """UCI (Universal Chess Interface) protocol handler (architecture.md §12).
 
 Per the module-boundary DAG (architecture.md §11), `uci.py` depends on
-`board`, `movegen`, `move`, `search`, `fen`, and `constants` — it is the
-outermost layer besides `cli.py`, and nothing below it in the DAG ever
+`board`, `movegen`, `move`, `search`, `book`, `fen`, and `constants` — it is
+the outermost layer besides `cli.py`, and nothing below it in the DAG ever
 imports it. It is also the only module that touches `sys.stdin`/`stdout`
 and `threading`.
+
+`cmd_go` consults `book.probe_book` before ever calling `Search.search`
+(architecture.md §15): a book hit for the current position short-circuits
+straight to `bestmove` and never spawns a search thread at all, keeping the
+book and the search engine fully decoupled — `search.py` has no knowledge
+of `book.py` and its own contract is unchanged by this.
 
 `UCIEngine` owns the engine's UCI-visible state: the current `Board`, a
 persistent `Search` instance (so its transposition table/killers/history
@@ -20,7 +26,7 @@ import sys
 import threading
 from typing import TextIO
 
-from . import fen, movegen
+from . import book, fen, movegen
 from .board import Board
 from .constants import WHITE
 from .evaluate import default_evaluator
@@ -219,11 +225,33 @@ class UCIEngine:
             self.search_thread.join()
 
     def cmd_go(self, args: list[str], out: TextIO) -> None:
-        """Parse `go`'s limits and hand the search off to a background
-        thread so this method (and thus the main stdin-reading loop) returns
-        immediately — `stop`/`quit` must never wait on a long search call
-        stack to unwind on its own (§9.3, §12)."""
+        """Consult the opening book first (architecture.md §15): if
+        `book.probe_book` finds an entry for the *current* position, reply
+        with `bestmove` immediately and return without ever touching
+        `parse_go_limits`/`Search.search` or spawning a search thread — the
+        book is strictly a pre-search gate, not a participant in the search
+        itself, and `Search.search`'s own contract is untouched by this.
+
+        Otherwise, parse `go`'s limits and hand the search off to a
+        background thread so this method (and thus the main stdin-reading
+        loop) returns immediately — `stop`/`quit` must never wait on a long
+        search call stack to unwind on its own (§9.3, §12)."""
         self._stop_and_join_search()
+
+        book_move = book.probe_book(self.board)
+        if book_move is not None:
+            # No search thread is spawned on this path, so there must be
+            # none left over for a later `stop`/`quit` to (harmlessly, but
+            # confusingly) join either: `_stop_and_join_search` above only
+            # joins a thread it finds *alive*, so `self.search_thread` can
+            # still be a finished thread object from a previous `go`.
+            # Clear it so this `go` leaves the same "no search in flight"
+            # state a real search leaves once it reports `bestmove`.
+            self.search_thread = None
+            out.write(f"bestmove {move_to_uci(book_move)}\n")
+            out.flush()
+            return
+
         limits = parse_go_limits(args, self.board.side_to_move)
         self.stop_event = threading.Event()
         self.search_thread = threading.Thread(

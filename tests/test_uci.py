@@ -97,8 +97,16 @@ def test_isready_emits_readyok() -> None:
 def test_full_session_produces_ordered_wellformed_output() -> None:
     """The scenario `test_uci.py` is named for in §13: a realistic scripted
     GUI session ending in `quit` right after `go`, at a shallow depth so the
-    search finishes almost immediately."""
-    commands = "uci\nisready\nposition startpos moves e2e4 e7e5\ngo depth 3\nquit\n"
+    search finishes almost immediately.
+
+    Deliberately played to a position *outside* `book.py`'s demonstration
+    repertoire (1...Nf6, not one of its listed replies to 1.e4): this test's
+    whole point is to see a real search actually run and report `info`
+    lines, which architecture.md §15's book short-circuit (see
+    `test_go_depth_10_from_startpos_uses_book_and_returns_fast` below, and
+    `test_book.py`) would otherwise skip entirely for a position the book
+    does recognize."""
+    commands = "uci\nisready\nposition startpos moves e2e4 g8f6\ngo depth 3\nquit\n"
     engine, output = _drive(commands)
     lines = _lines(output)
 
@@ -161,3 +169,61 @@ def test_position_startpos_moves_advances_side_to_move() -> None:
         "position startpos moves e2e4 e7e5\n", timeout=0.1
     )
     assert engine.board.side_to_move == WHITE
+
+
+# --- Opening book short-circuits `go` (architecture.md §12, §15) -----------
+
+
+def test_go_depth_10_from_startpos_uses_book_and_returns_fast() -> None:
+    """`cmd_go` consults `book.probe_book` *before* ever touching
+    `parse_go_limits`/`Search.search` (architecture.md §12, §15): a book hit
+    for the current position short-circuits straight to `bestmove` without
+    spawning a search thread at all.
+
+    From the starting position, `go depth 10` must therefore: (a) come back
+    with a single well-formed `bestmove` line, (b) that move must be one of
+    `OPENING_BOOK`'s own startpos entries, not just any legal move a real
+    search might have found, and (c) it must come back *fast* -- well under
+    what a genuine depth-10 search would ever take (a depth-6 search alone
+    already takes multiple seconds on this engine/evaluator), which is the
+    only external signal this black-box test has that no real search thread
+    ran at all.
+    """
+    from chessengine.board import Board
+    from chessengine.book import OPENING_BOOK
+
+    start_hash = Board.starting_position().zobrist_hash
+    book_ucis = {uci for uci, _weight in OPENING_BOOK[start_hash]}
+
+    commands = "uci\nisready\nposition startpos\ngo depth 10\n"
+    start = time.monotonic()
+    engine, output = _drive(commands, timeout=2.0)
+    elapsed = time.monotonic() - start
+
+    lines = _lines(output)
+    bestmove_lines = [line for line in lines if line.startswith("bestmove ")]
+    assert len(bestmove_lines) == 1, output
+    move_token = bestmove_lines[0].split()[1]
+    assert _UCI_MOVE_RE.match(move_token), f"malformed bestmove token: {move_token!r}"
+    assert move_token in book_ucis, (
+        f"bestmove {move_token!r} for 'go depth 10' from startpos wasn't one "
+        f"of the book's own entries for this position, {sorted(book_ucis)!r} "
+        "-- a real depth-10 search must not have been short-circuited by the book"
+    )
+
+    # `go depth 3`/`go depth 2` elsewhere in this file (a real, if shallow,
+    # search) already take a noticeable fraction of a second; an *unbounded*
+    # depth-10 search would take vastly longer than that. Coming back this
+    # fast is only possible if the book answered before `Search.search` (and
+    # its background thread) ever ran.
+    assert elapsed < 1.5, (
+        f"'go depth 10' from startpos took {elapsed:.3f}s -- the opening book "
+        "should have short-circuited this to an immediate bestmove with no "
+        "real depth-10 search ever running"
+    )
+
+    # No search thread should have been spawned on the book-hit path at all
+    # (architecture.md §12's cmd_go: `self.search_thread = None` on that
+    # branch), matching the "no real search ran" claim above directly rather
+    # than only inferring it from timing.
+    assert engine.search_thread is None
