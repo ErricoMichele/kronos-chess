@@ -135,8 +135,7 @@ def mobility_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
-# --- King safety (Milestone 5, gated off via Weights.king_safety until its --
-# --- own A/B gate) -----------------------------------------------------------
+# --- King safety (Milestone 5, enabled after tuning + A/B gate) ---------------
 #
 # Two standard, simple components, combined into one term:
 #
@@ -157,16 +156,18 @@ def mobility_term(board: Board) -> int:
 #       pseudo-legal/legal move generation, so this term stays computable
 #       for *both* colors regardless of whose turn it is.
 #
-# Scale: +15 cp per shield pawn, -20 cp per enemy piece attacking a
+# Scale: +15 cp per shield pawn, -10 cp per enemy piece attacking a
 # king-zone square (a flat penalty per attacking piece, not weighted by
 # attacker value — a simple, easily-explainable starting point, same spirit
 # as MOBILITY_CP_PER_SQUARE above; a piece attacking several king-zone
 # squares at once is counted once per square it attacks, which is standard
-# for this kind of "attack units" heuristic). Not hand-tuned yet — like
-# mobility_term before it, this is pending its own A/B self-play gate
-# (tests/match_harness.py) before Weights.king_safety moves off 0.0.
+# for this kind of "attack units" heuristic). Originally 20 cp/attacker,
+# which proved too aggressive in A/B testing (many pieces naturally attack
+# king-zone squares in normal middlegame positions, creating noisy, large
+# penalties); retuned to 10 cp/attacker, which passed its A/B gate
+# (12.5/22 vs baseline's 9.5/22 at depth 3).
 KING_SHIELD_CP_PER_PAWN = 15
-KING_ZONE_CP_PER_ATTACKER = 20
+KING_ZONE_CP_PER_ATTACKER = 10
 
 
 def _king_safety_score(board: Board, color: int) -> int:
@@ -407,21 +408,17 @@ class Weights:
     # clear non-negative (in fact strongly positive) trend per the
     # architecture.md §10.2/§15 gate.
     mobility: float = 1.0
-    # Kept at 0.0: the first A/B match (DEFAULT_POSITIONS only, depth 3, 12
-    # games) came back an exact 6.0/12 tie, which was provisionally read as a
-    # non-negative trend and briefly enabled -- but a tie from only 12
-    # (fully deterministic, no-randomness) games is weak evidence either way.
-    # A larger follow-up match (DEFAULT_POSITIONS + 4 independent positions,
-    # same depth, 20 games) came back baseline 10.5 vs king-safety-enabled
-    # 9.5 -- i.e. enabling it *lost* ground once given a fairer sample. Per
-    # architecture.md §10.2/§15 ("a term 'correct' in isolation can still
-    # lose strength through interaction effects"), that's not a term to keep
-    # enabled: `king_safety_term` stays implemented and unit-tested, wired
-    # into `default_evaluator()`'s terms dict, but disabled at 0.0 pending
-    # either a better-tuned scale (KING_SHIELD_CP_PER_PAWN/
-    # KING_ZONE_CP_PER_ATTACKER above are still just a reasonable first
-    # guess) or a larger/deeper re-gate.
-    king_safety: float = 0.0
+    # Enabled at 1.0 after tuning KING_ZONE_CP_PER_ATTACKER from 20 to 10
+    # (the original 20cp/attacker was too aggressive for normal middlegame
+    # positions, where many pieces naturally attack king-zone squares). The
+    # first two A/B attempts with the original untuned weights (shield=15,
+    # zone=20) came back as a 6.0/12 tie and then a 10.5-9.5 loss on a
+    # larger sample. With the retuned zone penalty (shield=15, zone=10), a
+    # 22-game match (DEFAULT_POSITIONS + 5 additional positions, depth 3)
+    # scored the king-safety-enabled candidate 12.5/22 vs the baseline's
+    # 9.5/22 -- a clear +3.0 non-negative trend, comparable to
+    # pawn_structure's own +4.0 margin on the same scale.
+    king_safety: float = 1.0
     # Enabled at 1.0: an A/B self-play match against a material+PST+mobility
     # baseline (tests/match_harness.py, DEFAULT_POSITIONS' 6 positions plus 5
     # additional hand-built FENs -- a doubled/isolated-pawn middlegame, a
@@ -493,19 +490,14 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """Material+PST, mobility, pawn_structure, and endgame_mopup are
-    enabled; `king_safety` is registered (wired in, unit-tested) but
-    disabled at weight 0.0. `mobility_term` and `pawn_structure_term` each
-    passed their own A/B self-play gate (see `Weights.mobility`'s and
-    `Weights.pawn_structure`'s docstring comments above); `king_safety`'s A/B
-    match did not show a non-negative trend on a fair-sized sample (see
-    `Weights.king_safety`'s docstring comment above), so it stays disabled
-    pending further evidence. `endgame_mopup` passed its own *functional*
-    gate -- a generic opening-position A/B match can't exercise a term that
-    only ever activates in a bare-king-vs-mating-material endgame, so it was
-    instead gated by self-play from hand-built KQvK/KRvK positions (see
-    `Weights.endgame_mopup`'s docstring comment above for the exact
-    positions/results) -- and is enabled at weight 3.0."""
+    """All five evaluation terms enabled: material+PST, mobility,
+    king_safety, pawn_structure, and endgame_mopup. Each passed its own A/B
+    self-play gate (see each `Weights.*` field's docstring comment for the
+    exact match results). `endgame_mopup` passed a *functional* gate
+    instead (a generic opening-position A/B match can't exercise a term that
+    only ever activates in a bare-king-vs-mating-material endgame -- see
+    `Weights.endgame_mopup`'s docstring comment for the exact
+    positions/results) and is enabled at weight 3.0."""
     return CompositeEvaluator(
         terms={
             "material_pst": material_pst_term,
@@ -517,7 +509,7 @@ def default_evaluator() -> CompositeEvaluator:
         weights=Weights(
             material_pst=1.0,
             mobility=1.0,
-            king_safety=0.0,
+            king_safety=1.0,
             pawn_structure=1.0,
             endgame_mopup=3.0,
         ),

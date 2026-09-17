@@ -149,22 +149,22 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
         )
 
 
-def test_default_evaluator_agrees_with_material_pst_plus_mobility_plus_pawn_structure() -> None:
-    """`default_evaluator()` enables `material_pst`, `mobility`, and
-    `pawn_structure`, all at weight 1.0 (the latter two each validated by
-    their own A/B self-play match, see `Weights.mobility`'s and
-    `Weights.pawn_structure`'s docstring comments in evaluate.py).
-    `king_safety` is registered but disabled at weight 0.0 (its own A/B
-    match did not show a non-negative trend on a fair-sized sample, see
-    `Weights.king_safety`'s docstring comment) and so must contribute
-    nothing -- output must equal the exact sum of just the three enabled
-    terms, on every sample position, not just correlate with it."""
+def test_default_evaluator_agrees_with_all_enabled_terms() -> None:
+    """`default_evaluator()` enables `material_pst`, `mobility`,
+    `king_safety`, and `pawn_structure`, all at weight 1.0, plus
+    `endgame_mopup` at weight 3.0.  Output must equal the exact weighted
+    sum of all five terms on every sample position."""
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
-        assert evaluator.evaluate(board) == (
-            material_pst_term(board) + mobility_term(board) + pawn_structure_term(board)
+        expected = (
+            material_pst_term(board)
+            + mobility_term(board)
+            + king_safety_term(board)
+            + pawn_structure_term(board)
+            + int(3.0 * endgame_mopup_term(board))
         )
+        assert evaluator.evaluate(board) == expected
 
 
 # --- 2. Material term sanity: an extra queen is worth about +900 ------------
@@ -306,21 +306,14 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
     assert evaluator.evaluate(board) == material_pst_term(board)
 
 
-def test_default_evaluator_enables_material_pst_mobility_and_pawn_structure() -> None:
-    """`default_evaluator()` enables `material_pst`, `mobility`,
-    `pawn_structure`, and `endgame_mopup` at nonzero weight (`mobility`/
-    `pawn_structure` each validated by their own A/B self-play match,
-    architecture.md §10.2/§15's gate -- see `Weights.mobility`'s and
-    `Weights.pawn_structure`'s docstring comments; `endgame_mopup` validated
-    by its own *functional* gate instead, since a generic opening-position
-    A/B match can't exercise a term that only activates in a bare-king-vs-
-    mating-material endgame -- see `Weights.endgame_mopup`'s docstring
-    comment for the exact positions/results). `king_safety` is registered
-    (`king_safety_term` is implemented and unit-tested below) but stays at
-    weight 0.0: its own A/B match did not show a non-negative trend on a
-    fair-sized sample (see `Weights.king_safety`'s docstring comment) --
-    pinned down field by field so a future term accidentally left enabled
-    early (or a validated one accidentally left disabled/enabled) would
+def test_default_evaluator_enables_all_five_terms() -> None:
+    """`default_evaluator()` enables all five registered terms at their
+    documented weights: `material_pst`, `mobility`, `king_safety`, and
+    `pawn_structure` each at 1.0 (each validated by its own A/B self-play
+    match -- see `Weights.*`'s docstring comments in evaluate.py), and
+    `endgame_mopup` at 3.0 (validated by its own *functional* gate -- see
+    `Weights.endgame_mopup`'s docstring comment for the exact positions/
+    results). Pinned field by field so an accidentally changed weight would
     fail this test."""
     evaluator = default_evaluator()
 
@@ -339,7 +332,7 @@ def test_default_evaluator_enables_material_pst_mobility_and_pawn_structure() ->
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
-    assert evaluator.weights.king_safety == 0.0
+    assert evaluator.weights.king_safety == 1.0
     assert evaluator.weights.pawn_structure == 1.0
     assert evaluator.weights.endgame_mopup == 3.0
 
@@ -531,16 +524,16 @@ def test_king_safety_term_favors_castled_shielded_king_over_exposed_king() -> No
 
     White: Kg1 with an intact 3-pawn shield on f2/g2/h2 (shield = 3, +45 cp)
     and zero enemy pieces attacking its king zone (f1/h1/f2/g2/h2) -- White's
-    own `_king_safety_score` is exactly 3*15 - 0*20 = +45.
+    own `_king_safety_score` is exactly 3*15 - 0*10 = +45.
 
     Black: Ke5 with no pawn shield at all (shield = 0) and four White pieces
     each attacking one distinct square of its 8-square king zone
     (d4/e4/f4/d5/f5/d6/e6/f6): Bb2->d4, Re1->e4 (blocked by the king itself,
     same as a real check would be), Qh5->f5 (blocked from going further by
     the king), and Nc4->d6. That's 4 attackers, so Black's own
-    `_king_safety_score` is exactly 0*15 - 4*20 = -80.
+    `_king_safety_score` is exactly 0*15 - 4*10 = -40.
 
-    `king_safety_term` = white_score - black_score = 45 - (-80) = +125,
+    `king_safety_term` = white_score - black_score = 45 - (-40) = +85,
     checked exactly (not just ">0"), with every shield pawn and every
     attacker above counted by hand and independently confirmed against
     `_king_safety_score`.
@@ -553,12 +546,12 @@ def test_king_safety_term_favors_castled_shielded_king_over_exposed_king() -> No
         f"expected king_safety_term to favor White's castled, shielded king "
         f"over Black's exposed, attacked king, got {score}"
     )
-    assert score == 125, f"expected king_safety_term == +125 exactly, got {score}"
+    assert score == 85, f"expected king_safety_term == +85 exactly, got {score}"
 
     # Sanity-check the hand-derived components directly, so a passing test
     # can't be an accident of unrelated cancellation.
     assert KING_SHIELD_CP_PER_PAWN == 15
-    assert KING_ZONE_CP_PER_ATTACKER == 20
+    assert KING_ZONE_CP_PER_ATTACKER == 10
 
 
 def test_king_safety_term_favors_castled_shielded_king_regardless_of_side_to_move() -> None:
@@ -575,7 +568,7 @@ def test_king_safety_term_favors_castled_shielded_king_regardless_of_side_to_mov
         f"expected king_safety_term to disfavor Black (the side to move, and "
         f"the side with the exposed, attacked king) here, got {score}"
     )
-    assert score == -125, f"expected king_safety_term == -125 exactly, got {score}"
+    assert score == -85, f"expected king_safety_term == -85 exactly, got {score}"
 
 
 # --- pawn_structure_term --------------------------------------------------
