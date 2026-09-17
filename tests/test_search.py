@@ -1,4 +1,4 @@
-"""Milestone 2 exit-criteria tests for `search.py` (architecture.md §9, §15).
+"""Milestone 2/4 exit-criteria tests for `search.py` (architecture.md §9, §15).
 
 §15's Milestone 2 exit criteria call for exactly two things beyond
 `test_evaluate.py` (which is out of scope for this file, since it exercises
@@ -25,9 +25,27 @@
 Depths and positions below are deliberately kept small (fixed depth 3 for
 the differential oracle, depth 2 for self-play) so the whole file runs in a
 few seconds, not minutes.
+
+**Milestone 4 update.** Since `Search._negamax`'s `depth == 0` leaf now hands
+off to `Search._quiescence` rather than evaluating statically (architecture.md
+§9.5), the oracle's own depth-0 case mirrors that with `_naive_quiescence`: an
+unpruned (no alpha-beta window) capture search that nonetheless applies the
+*same* `see_ge` capture filtering `Search._quiescence` does. That filtering is
+deliberately kept identical between engine and oracle rather than dropped,
+because SEE-based pruning is a *heuristic* move filter, not a window
+optimization -- per §9.5 it can change which captures are ever searched
+(unlike alpha-beta, which never changes the resulting score, only how many
+nodes it takes to compute it). Comparing against an oracle that searched
+*every* capture, with no SEE filtering at all, would then be expected to
+diverge from the engine even with zero alpha-beta bugs, which would defeat
+this test's actual purpose. Keeping the SEE filtering identical on both
+sides isolates exactly what this test is for: alpha-beta window bugs, not
+SEE's own known, accepted imprecision.
 """
 
 from __future__ import annotations
+
+import threading
 
 import pytest
 
@@ -36,10 +54,31 @@ from chessengine.constants import DRAW_SCORE, INF, MATE_SCORE
 from chessengine.evaluate import default_evaluator
 from chessengine.fen import parse_fen
 from chessengine.move import NULL_MOVE, move_to_uci
-from chessengine.movegen import generate_legal_moves
-from chessengine.search import Search, SearchLimits, _SearchCtx
+from chessengine.movegen import generate_captures, generate_legal_moves
+from chessengine.search import Search, SearchLimits, _SearchCtx, see_ge
 
 # --- 1. Differential test: Search._negamax vs. a naive, unpruned oracle -----
+
+
+def _naive_quiescence(board: Board, ply: int) -> int:
+    """A deliberately naive mirror of `Search._quiescence`: the same
+    stand-pat bound, the same `see_ge`-gated capture set (so a SEE-pruned
+    capture is skipped identically on both sides, per this module's
+    docstring), but **no** alpha-beta window -- every surviving capture is
+    searched and the true maximum taken, rather than cutting off as soon as
+    one is known to be at least as good as `beta`.
+    """
+    stand_pat = _ORACLE_EVALUATOR.evaluate(board)
+    best = stand_pat
+    for move in generate_captures(board):
+        if not see_ge(board, move, 0):
+            continue
+        board.make_move(move)
+        score = -_naive_quiescence(board, ply + 1)
+        board.unmake_move()
+        if score > best:
+            best = score
+    return best
 
 
 def _naive_full_width_negamax(board: Board, depth: int, ply: int = 0) -> int:
@@ -51,15 +90,15 @@ def _naive_full_width_negamax(board: Board, depth: int, ply: int = 0) -> int:
 
     This shares only *what a position's minimax value means* with
     `Search._negamax` (draw scoring, mate scoring relative to `ply`, the
-    same evaluator at the leaves) -- never *how* it is computed. Any
-    divergence between this and `Search._negamax`'s score at the same
-    (position, depth) is therefore a real alpha-beta bug, not a difference
-    in search strategy.
+    same evaluator and the same `see_ge`-gated quiescence at the leaves,
+    §9.5) -- never *how* it is computed. Any divergence between this and
+    `Search._negamax`'s score at the same (position, depth) is therefore a
+    real alpha-beta bug, not a difference in search strategy.
     """
     if board.is_fifty_move_draw() or board.is_repetition_draw():
         return DRAW_SCORE
     if depth == 0:
-        return _ORACLE_EVALUATOR.evaluate(board)
+        return _naive_quiescence(board, ply)
 
     moves = generate_legal_moves(board)
     if not moves:
@@ -205,3 +244,50 @@ def test_self_play_never_returns_an_illegal_move_and_terminates_cleanly() -> Non
 
     assert plies_played <= _SELF_PLAY_MAX_PLIES
     assert game_over_reason is not None
+
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        None,  # startpos
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",  # Kiwipete
+    ],
+)
+def test_search_never_returns_null_move_on_immediate_stop(fen: str | None) -> None:
+    """Regression test for a real bug caught end-to-end via the UCI layer:
+    `Search.search` must never hand back `NULL_MOVE` just because a stop
+    signal (a real `stop_event`, or a node/time budget) fires before the
+    very first iterative-deepening iteration (depth 1) finishes even one
+    root move.
+
+    Before the fix, `search()` seeded `best` with `NULL_MOVE` and only
+    discarded an aborted iteration's result when `depth > 1` -- so an
+    immediate stop during depth 1 left `best.best_move` at its `NULL_MOVE`
+    default (no TT entry had been stored yet for `_extract_pv` to find).
+    Reported over UCI, this became an illegal `bestmove a1a1` -- a genuine
+    forfeit/crash risk for any GUI whose `stop`/short `movetime` can land
+    before a slow position's first root move completes (quiescence search
+    makes root nodes expensive enough that this is a real scenario, not
+    just a pathological one).
+
+    The fix seeds an *ordered* legal fallback move before the loop starts,
+    so an immediate stop still returns a legal (if unoptimized) move.
+    """
+    board = Board.starting_position() if fen is None else parse_fen(fen)
+    legal_moves = generate_legal_moves(board)
+    assert legal_moves, "test position must not itself be terminal"
+
+    search = Search(default_evaluator())
+    stop_event = threading.Event()
+    stop_event.set()  # simulate a stop that fires before search even starts
+
+    result = search.search(board, SearchLimits(max_depth=10), stop_event=stop_event)
+
+    assert result.best_move != NULL_MOVE, (
+        "search.search returned NULL_MOVE under an immediate stop -- this would "
+        "be reported as an illegal 'bestmove a1a1' over UCI"
+    )
+    assert result.best_move in legal_moves, (
+        f"fallback move {move_to_uci(result.best_move)!r} is not even legal "
+        f"in position {board.to_fen()!r}"
+    )
