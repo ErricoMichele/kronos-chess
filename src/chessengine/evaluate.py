@@ -22,10 +22,12 @@ from .board import Board
 from .constants import (
     BISHOP,
     BLACK,
+    FILE_MASK,
     KING,
     KNIGHT,
     PAWN,
     QUEEN,
+    RANK_MASK,
     ROOK,
     WHITE,
     file_of,
@@ -261,6 +263,106 @@ def king_safety_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- Pawn structure (implemented, gated off via Weights.pawn_structure until --
+# --- its own A/B match) ------------------------------------------------------
+#
+# Three standard, simple components, combined into one term, computed
+# directly from `board.pieces[color][PAWN]` bitboards plus FILE_MASK/
+# RANK_MASK (constants.py) -- no movegen.py dependency, same DAG-respecting
+# pattern as mobility_term/king_safety_term above (this term doesn't even
+# need to reach as far as attacks.py: file/rank masks are enough).
+#
+#   (a) Doubled pawns: on a given file, every friendly pawn beyond the
+#       first is "doubled" -- they block each other's advance and, between
+#       them, defend fewer squares than two pawns on separate files would.
+#   (b) Isolated pawns: a pawn with no friendly pawn on either adjacent
+#       file can never be defended by another pawn for the rest of the
+#       game -- a permanent structural weakness, independent of anything
+#       else on the board.
+#   (c) Passed pawns: a pawn with no enemy pawn anywhere on its own file or
+#       either adjacent file, from its current rank all the way to its
+#       promotion square, can only ever be stopped by a piece, never by a
+#       pawn -- the single most important structural feature in the
+#       endgame. The bonus is scaled by how many squares remain to
+#       promotion, since a passed pawn's danger grows sharply, not
+#       linearly, as it advances (a 7th-rank passer is often worth close
+#       to a minor piece; a 2nd-rank one is a long-term asset at most).
+#
+# Scales (centipawns; simple starting points in the same spirit as
+# MOBILITY_CP_PER_SQUARE/KING_SHIELD_CP_PER_PAWN above -- not hand-tuned,
+# pending an A/B self-play gate via tests/match_harness.py before
+# Weights.pawn_structure moves off 0.0):
+#   - DOUBLED_PAWN_PENALTY_CP: -12 cp per pawn beyond the first on a file.
+#     Kept small: doubled pawns are a real but mild weakness, and this
+#     already penalizes each extra pawn on the file individually, so a
+#     triple-doubled file naturally costs proportionally more without a
+#     separate multiplier.
+#   - ISOLATED_PAWN_PENALTY_CP: -15 cp per isolated pawn. A little larger
+#     than the doubled penalty -- an isolated pawn is a standing target for
+#     the whole game, not just a local inefficiency.
+#   - PASSED_PAWN_BONUS_BY_DISTANCE: indexed by squares-still-to-travel to
+#     the promotion square (0 = the pawn's next push promotes it), so the
+#     bonus grows sharply near promotion rather than growing linearly with
+#     rank.
+DOUBLED_PAWN_PENALTY_CP = 12
+ISOLATED_PAWN_PENALTY_CP = 15
+PASSED_PAWN_BONUS_BY_DISTANCE = (200, 150, 100, 60, 35, 20, 10, 0)
+# index 0 = one square from promotion ... index 6 = a pawn still on its own
+# starting rank; index 7 is unused in practice (kept so any distance in
+# [0, 7] safely indexes the table) since a pawn cannot stand on the
+# promotion rank itself without having already promoted.
+
+# Precomputed once at import time (same style as attacks.py's RAY_ATTACKS):
+# _AHEAD_RANK_MASK[color][r] = union of RANK_MASK for every rank strictly
+# between rank r and that color's promotion rank, exclusive of r itself.
+_AHEAD_RANK_MASK: dict[int, list[int]] = {WHITE: [0] * 8, BLACK: [0] * 8}
+for _r in range(8):
+    for _rr in range(_r + 1, 8):
+        _AHEAD_RANK_MASK[WHITE][_r] |= RANK_MASK[_rr]
+    for _rr in range(0, _r):
+        _AHEAD_RANK_MASK[BLACK][_r] |= RANK_MASK[_rr]
+del _r, _rr
+
+
+def _side_pawn_structure(board: Board, color: int) -> int:
+    pawns = board.pieces[color][PAWN]
+    enemy_pawns = board.pieces[1 - color][PAWN]
+    ahead_rank_mask = _AHEAD_RANK_MASK[color]
+    score = 0
+
+    # (a) Doubled pawns.
+    for f in range(8):
+        count = popcount(pawns & FILE_MASK[f])
+        if count > 1:
+            score -= (count - 1) * DOUBLED_PAWN_PENALTY_CP
+
+    for sq in iter_bits(pawns):
+        f, r = file_of(sq), rank_of(sq)
+        adjacent_files = 0
+        if f > 0:
+            adjacent_files |= FILE_MASK[f - 1]
+        if f < 7:
+            adjacent_files |= FILE_MASK[f + 1]
+
+        # (b) Isolated pawns: no friendly pawn on either adjacent file.
+        if not (pawns & adjacent_files):
+            score -= ISOLATED_PAWN_PENALTY_CP
+
+        # (c) Passed pawns: no enemy pawn on this file or an adjacent file,
+        # anywhere between this pawn and its promotion square.
+        span_files = FILE_MASK[f] | adjacent_files
+        if not (enemy_pawns & span_files & ahead_rank_mask[r]):
+            distance = (7 - r) if color == WHITE else r
+            score += PASSED_PAWN_BONUS_BY_DISTANCE[distance]
+
+    return score
+
+
+def pawn_structure_term(board: Board) -> int:
+    white_score = _side_pawn_structure(board, WHITE) - _side_pawn_structure(board, BLACK)
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -288,7 +390,20 @@ class Weights:
     # KING_ZONE_CP_PER_ATTACKER above are still just a reasonable first
     # guess) or a larger/deeper re-gate.
     king_safety: float = 0.0
-    pawn_structure: float = 0.0
+    # Enabled at 1.0: an A/B self-play match against a material+PST+mobility
+    # baseline (tests/match_harness.py, DEFAULT_POSITIONS' 6 positions plus 5
+    # additional hand-built FENs -- a doubled/isolated-pawn middlegame, a
+    # passed-pawn K+P endgame, a clean symmetric control middlegame, an IQP
+    # middlegame, and that doubled/isolated position's color-flipped mirror
+    # -- 11 positions x 2 colors = 22 games, depth 3) scored the
+    # pawn-structure-enabled candidate 13.0/22 vs the baseline's 9.0/22.
+    # Broken down by position (both colors of each position paired), the
+    # candidate was clearly ahead on 5 of the 11 positions, the baseline
+    # clearly ahead on only 2, and 4 tied -- a distributed, non-negative
+    # trend (not one outlier position skewing the total), and a real margin
+    # rather than the near-tie/1-point-out-of-20 "muddle" that sank
+    # king_safety above. Kept at 1.0 per architecture.md §10.2/§15.
+    pawn_structure: float = 1.0
 
 
 class CompositeEvaluator:
@@ -310,17 +425,20 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """Material+PST and mobility are enabled; `mobility_term` passed its A/B
-    gate (see `Weights.mobility`'s docstring comment above). `king_safety`
-    is registered (wired in, unit-tested) but disabled at weight 0.0 -- its
-    A/B match did not show a non-negative trend on a fair-sized sample (see
-    `Weights.king_safety`'s docstring comment above). `pawn_structure`
-    remains unimplemented entirely."""
+    """Material+PST, mobility, and pawn_structure are enabled; `king_safety`
+    is registered (wired in, unit-tested) but disabled at weight 0.0.
+    `mobility_term` and `pawn_structure_term` each passed their own A/B
+    self-play gate (see `Weights.mobility`'s and `Weights.pawn_structure`'s
+    docstring comments above); `king_safety`'s A/B match did not show a
+    non-negative trend on a fair-sized sample (see `Weights.king_safety`'s
+    docstring comment above), so it stays disabled pending a better-tuned
+    scale or a larger/deeper re-gate."""
     return CompositeEvaluator(
         terms={
             "material_pst": material_pst_term,
             "mobility": mobility_term,
             "king_safety": king_safety_term,
+            "pawn_structure": pawn_structure_term,
         },
-        weights=Weights(material_pst=1.0, mobility=1.0, king_safety=0.0),
+        weights=Weights(material_pst=1.0, mobility=1.0, king_safety=0.0, pawn_structure=1.0),
     )

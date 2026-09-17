@@ -33,8 +33,11 @@ from __future__ import annotations
 from chessengine.board import Board
 from chessengine.constants import NO_PIECE, WHITE, color_of, piece_type_of
 from chessengine.evaluate import (
+    DOUBLED_PAWN_PENALTY_CP,
+    ISOLATED_PAWN_PENALTY_CP,
     KING_SHIELD_CP_PER_PAWN,
     KING_ZONE_CP_PER_ATTACKER,
+    PASSED_PAWN_BONUS_BY_DISTANCE,
     CompositeEvaluator,
     KNIGHT_PST,
     QUEEN_PST,
@@ -43,6 +46,7 @@ from chessengine.evaluate import (
     king_safety_term,
     material_pst_term,
     mobility_term,
+    pawn_structure_term,
 )
 from chessengine.fen import STARTPOS_FEN, parse_fen
 
@@ -142,19 +146,22 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
         )
 
 
-def test_default_evaluator_agrees_with_material_pst_plus_mobility() -> None:
-    """`default_evaluator()` enables `material_pst` and `mobility`, both at
-    weight 1.0 (the latter validated by an A/B self-play match, see
-    `Weights.mobility`'s docstring comment in evaluate.py). `king_safety` is
-    registered but disabled at weight 0.0 (its own A/B match did not show a
-    non-negative trend on a fair-sized sample, see `Weights.king_safety`'s
-    docstring comment) and so must contribute nothing -- output must equal
-    the exact sum of just the two enabled terms, on every sample position,
-    not just correlate with it."""
+def test_default_evaluator_agrees_with_material_pst_plus_mobility_plus_pawn_structure() -> None:
+    """`default_evaluator()` enables `material_pst`, `mobility`, and
+    `pawn_structure`, all at weight 1.0 (the latter two each validated by
+    their own A/B self-play match, see `Weights.mobility`'s and
+    `Weights.pawn_structure`'s docstring comments in evaluate.py).
+    `king_safety` is registered but disabled at weight 0.0 (its own A/B
+    match did not show a non-negative trend on a fair-sized sample, see
+    `Weights.king_safety`'s docstring comment) and so must contribute
+    nothing -- output must equal the exact sum of just the three enabled
+    terms, on every sample position, not just correlate with it."""
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
-        assert evaluator.evaluate(board) == material_pst_term(board) + mobility_term(board)
+        assert evaluator.evaluate(board) == (
+            material_pst_term(board) + mobility_term(board) + pawn_structure_term(board)
+        )
 
 
 # --- 2. Material term sanity: an extra queen is worth about +900 ------------
@@ -296,29 +303,29 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
     assert evaluator.evaluate(board) == material_pst_term(board)
 
 
-def test_default_evaluator_enables_material_pst_and_mobility_only() -> None:
-    """`default_evaluator()` enables `material_pst` and `mobility` at
-    nonzero weight (the latter validated by an A/B self-play match,
-    architecture.md §10.2/§15's gate -- see `Weights.mobility`'s docstring
-    comment). `king_safety` is registered (`king_safety_term` is
-    implemented and unit-tested below) but stays at weight 0.0 -- its own
-    A/B match did not show a non-negative trend on a fair-sized sample, see
-    `Weights.king_safety`'s docstring comment. `pawn_structure` remains
-    fully unimplemented (no entry in `terms` at all) and stays at 0.0 --
-    pinned down field by field so a future term accidentally left enabled
-    early (or a validated one accidentally left disabled/enabled) would
-    fail this test."""
+def test_default_evaluator_enables_material_pst_mobility_and_pawn_structure() -> None:
+    """`default_evaluator()` enables `material_pst`, `mobility`, and
+    `pawn_structure` at nonzero weight (the latter two each validated by
+    their own A/B self-play match, architecture.md §10.2/§15's gate -- see
+    `Weights.mobility`'s and `Weights.pawn_structure`'s docstring comments).
+    `king_safety` is registered (`king_safety_term` is implemented and
+    unit-tested below) but stays at weight 0.0: its own A/B match did not
+    show a non-negative trend on a fair-sized sample (see
+    `Weights.king_safety`'s docstring comment) -- pinned down field by field
+    so a future term accidentally left enabled early (or a validated one
+    accidentally left disabled/enabled) would fail this test."""
     evaluator = default_evaluator()
 
-    assert set(evaluator.terms) == {"material_pst", "mobility", "king_safety"}
+    assert set(evaluator.terms) == {"material_pst", "mobility", "king_safety", "pawn_structure"}
     assert evaluator.terms["material_pst"] is material_pst_term
     assert evaluator.terms["mobility"] is mobility_term
     assert evaluator.terms["king_safety"] is king_safety_term
+    assert evaluator.terms["pawn_structure"] is pawn_structure_term
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
     assert evaluator.weights.king_safety == 0.0
-    assert evaluator.weights.pawn_structure == 0.0
+    assert evaluator.weights.pawn_structure == 1.0
 
 
 # --- mobility_term ------------------------------------------------------
@@ -553,3 +560,207 @@ def test_king_safety_term_favors_castled_shielded_king_regardless_of_side_to_mov
         f"the side with the exposed, attacked king) here, got {score}"
     )
     assert score == -125, f"expected king_safety_term == -125 exactly, got {score}"
+
+
+# --- pawn_structure_term --------------------------------------------------
+#
+# `pawn_structure_term` (implemented, enabled via `Weights.pawn_structure`
+# after passing its own A/B match -- see the term's module comment and
+# `Weights.pawn_structure` docstring in evaluate.py) combines three
+# components computed per side directly from `board.pieces[color][PAWN]`:
+# doubled-pawn penalties, isolated-pawn penalties, and distance-scaled
+# passed-pawn bonuses. These tests reuse exactly the same
+# `_color_flip_pieces`/`SYMMETRY_FENS` pattern used for
+# `material_pst_term`/`mobility_term`/`king_safety_term` above, rather than
+# inventing a fourth, parallel mirroring convention.
+
+
+# --- 1. Color-flip symmetry --------------------------------------------------
+
+
+def test_pawn_structure_term_negates_under_color_flip_mirror() -> None:
+    """`pawn_structure_term(mirror) == -pawn_structure_term(original)` for
+    every sample position -- the same color-flip symmetry checked for
+    `material_pst_term`/`mobility_term`/`king_safety_term` above, now for the
+    pawn-structure term (catches e.g. a doubled/isolated/passed check
+    computed against the wrong color's pawns, or a passed-pawn distance
+    computed with the wrong promotion direction for Black)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        mirror = _color_flip_pieces(board)
+        assert pawn_structure_term(mirror) == -pawn_structure_term(board), (
+            f"color-flip symmetry broken for {fen!r}: "
+            f"pawn_structure_term(original)={pawn_structure_term(board)}, "
+            f"pawn_structure_term(mirror)={pawn_structure_term(mirror)}"
+        )
+
+
+def test_pawn_structure_term_double_mirror_restores_original_score() -> None:
+    """Mirroring twice is the identity transform on piece placement, so it
+    must also be the identity on `pawn_structure_term` (a second, independent
+    check on top of the plain negation above)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        double_mirror = _color_flip_pieces(_color_flip_pieces(board))
+        assert pawn_structure_term(double_mirror) == pawn_structure_term(board)
+
+
+def test_pawn_structure_term_zero_for_startpos() -> None:
+    """The starting position has, on both sides, all 8 files occupied by
+    exactly one pawn each: no file ever has more than one pawn (no doubling),
+    every pawn has a same-rank neighbor on an adjacent file (no isolation --
+    even the a- and h-file pawns have their one adjacent file occupied), and
+    every pawn is blocked from ever passing by the opponent's mirrored pawn
+    two ranks further up its own file (no passed pawns). So both sides'
+    `_side_pawn_structure` is exactly 0 and `pawn_structure_term` must be
+    exactly 0, not just "small" or "roughly balanced"."""
+    assert pawn_structure_term(parse_fen(STARTPOS_FEN)) == 0
+
+
+# --- 2. Doubled pawns: a doubled file is clearly worse than a clean one -----
+
+
+def test_pawn_structure_term_penalizes_doubled_pawn() -> None:
+    """A FEN with a doubled White pawn on the d-file (d2 and d3), with every
+    pawn already defended from isolation by a pawn on an adjacent file (e2)
+    and every pawn blocked from passing by Black's c7/d7/e7 pawns -- so
+    doubling is the *only* structural feature in play -- must score
+    `pawn_structure_term` clearly worse for White than the same position
+    with the extra d-file pawn removed.
+
+    Position with the doubled pawn (White to move):
+        8  . . . . k . . .
+        7  . . . p p p . .
+        6  . . . . . . . .
+        5  . . . . . . . .
+        4  . . . . . . . .
+        3  . . . P . . . .
+        2  . . . P P P . .
+        1  . . . . K . . .
+           a b c d e f g h
+
+    White's d-file has 2 pawns (d2, d3): exactly one "extra" pawn beyond the
+    first, so `_side_pawn_structure` docks exactly
+    `DOUBLED_PAWN_PENALTY_CP` (=12) once for that file. Neither d-pawn is
+    isolated (e2 sits on the adjacent e-file) and none of White's pawns are
+    passed (Black's c7/d7/e7 block the d/e/f files). Black's own structure
+    (c7/d7/e7, no doubling, no isolation, blocked from passing by White's
+    d/e/f-file pawns) is identical in both FENs, so it only has to cancel
+    out, not equal any particular value.
+    """
+    fen_doubled = "4k3/3ppp2/8/8/8/3P4/3PPP2/4K3 w - - 0 1"
+    fen_fixed = "4k3/3ppp2/8/8/8/8/3PPP2/4K3 w - - 0 1"  # extra d3 pawn removed
+
+    score_doubled = pawn_structure_term(parse_fen(fen_doubled))
+    score_fixed = pawn_structure_term(parse_fen(fen_fixed))
+
+    assert score_doubled < score_fixed, (
+        f"expected the doubled d-file to score clearly worse for White, got "
+        f"doubled={score_doubled}, fixed={score_fixed}"
+    )
+    # Hand-verified exactly: doubling is the only difference between the two
+    # FENs, and it costs precisely one DOUBLED_PAWN_PENALTY_CP.
+    assert score_fixed == 0, f"expected the clean structure to score exactly 0, got {score_fixed}"
+    assert score_doubled == -DOUBLED_PAWN_PENALTY_CP, (
+        f"expected the doubled structure to score exactly -{DOUBLED_PAWN_PENALTY_CP}, "
+        f"got {score_doubled}"
+    )
+
+
+# --- 3. Isolated pawns: an isolated pawn is clearly worse than a supported one
+
+
+def test_pawn_structure_term_penalizes_isolated_pawn() -> None:
+    """A FEN with a lone, isolated White d-pawn (no White pawn on the c- or
+    e-file) must score `pawn_structure_term` clearly worse for White than
+    the same position with a pawn added on e2 -- which gives the d-pawn (and
+    the new e-pawn) a same-rank neighbor, eliminating the isolation.
+
+    Position with the isolated pawn (White to move):
+        8  . . . . k . . .
+        7  . . p p p . . .
+        6  . . . . . . . .
+        5  . . . . . . . .
+        4  . . . . . . . .
+        3  . . . . . . . .
+        2  . . . P . . . .
+        1  . . . . K . . .
+           a b c d e f g h
+
+    White's only pawn (d2) has no friendly pawn on the c- or e-file, so it is
+    isolated: `_side_pawn_structure` docks exactly `ISOLATED_PAWN_PENALTY_CP`
+    (=15). It is not doubled (only one pawn on the d-file) and not passed
+    (Black's c7/d7/e7 block the c/d/e files it would have to cross). Adding a
+    White pawn on e2 gives d2 an adjacent-file neighbor (no longer isolated)
+    and the new e2 pawn also has d2 as its own neighbor (not isolated
+    either); e2 is likewise not passed (blocked by Black's d7/e7). Black's
+    own structure (c7/d7/e7, unaffected either way) only has to cancel out,
+    not equal any particular value.
+    """
+    fen_isolated = "4k3/2ppp3/8/8/8/8/3P4/4K3 w - - 0 1"
+    fen_fixed = "4k3/2ppp3/8/8/8/8/3PP3/4K3 w - - 0 1"  # e2 pawn added
+
+    score_isolated = pawn_structure_term(parse_fen(fen_isolated))
+    score_fixed = pawn_structure_term(parse_fen(fen_fixed))
+
+    assert score_isolated < score_fixed, (
+        f"expected the isolated d-pawn to score clearly worse for White, got "
+        f"isolated={score_isolated}, fixed={score_fixed}"
+    )
+    # Hand-verified exactly: isolation is the only difference between the
+    # two FENs, and it costs precisely one ISOLATED_PAWN_PENALTY_CP.
+    assert score_fixed == 0, f"expected the supported structure to score exactly 0, got {score_fixed}"
+    assert score_isolated == -ISOLATED_PAWN_PENALTY_CP, (
+        f"expected the isolated structure to score exactly -{ISOLATED_PAWN_PENALTY_CP}, "
+        f"got {score_isolated}"
+    )
+
+
+# --- 4. Passed pawns: a passed pawn scores better, and more advanced is better
+
+
+def test_pawn_structure_term_favors_more_advanced_passed_pawn() -> None:
+    """Two FENs with an otherwise-identical White structure -- a fixed,
+    unadvanced e2 pawn (itself passed too, since Black has no pawns at all)
+    plus one White pawn on the d-file that is unambiguously passed (no Black
+    pawns anywhere on the board, let alone on the c/d/e files ahead of it) --
+    differing *only* in how far that d-pawn has advanced (d3 vs. d6), must
+    both score `pawn_structure_term` clearly positive for White (a passed
+    pawn is a clear structural asset), and the more advanced pawn (d6, only
+    2 squares from promotion) must score strictly higher than the less
+    advanced one (d3, 5 squares from promotion) -- `PASSED_PAWN_BONUS_BY_DISTANCE`
+    grows as a passer nears promotion, so distance 2 (bonus 100) must beat
+    distance 5 (bonus 20).
+
+    Neither pawn is ever doubled (one pawn per file) or isolated (the d-pawn
+    always has e2 as an adjacent-file neighbor, and e2 always has the d-pawn
+    as its own), in either FEN, so the score difference between the two FENs
+    is exactly the passed-pawn bonus difference for the d-pawn alone
+    (e2's own passed bonus, from its fixed, unadvanced position, is
+    identical in both FENs and only has to cancel out of the *comparison*,
+    not vanish from either score individually).
+    """
+    fen_less_advanced = "6k1/8/8/8/8/3P4/4P3/6K1 w - - 0 1"  # passed d-pawn on d3
+    fen_more_advanced = "6k1/8/3P4/8/8/8/4P3/6K1 w - - 0 1"  # passed d-pawn on d6
+
+    score_less_advanced = pawn_structure_term(parse_fen(fen_less_advanced))
+    score_more_advanced = pawn_structure_term(parse_fen(fen_more_advanced))
+
+    assert score_less_advanced > 0, (
+        f"expected a clear passed pawn to score clearly positive for White, "
+        f"got {score_less_advanced}"
+    )
+    assert score_more_advanced > 0, (
+        f"expected a clear passed pawn to score clearly positive for White, "
+        f"got {score_more_advanced}"
+    )
+    assert score_more_advanced > score_less_advanced, (
+        f"expected the more advanced passed pawn (d6) to score higher than the "
+        f"less advanced one (d3), got more_advanced={score_more_advanced}, "
+        f"less_advanced={score_less_advanced}"
+    )
+    # Hand-verified exactly: e2's own passed bonus (distance 6 -> 10 cp) is
+    # identical in both FENs, so the only difference is the d-pawn's own
+    # passed bonus at distance 5 (d3, 20 cp) vs. distance 2 (d6, 100 cp).
+    assert score_less_advanced == 10 + PASSED_PAWN_BONUS_BY_DISTANCE[5] == 30
+    assert score_more_advanced == 10 + PASSED_PAWN_BONUS_BY_DISTANCE[2] == 110
