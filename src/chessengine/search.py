@@ -340,6 +340,16 @@ class _SearchCtx:
         self.stop_event = stop_event
         self.extra_stop = extra_stop
         self.nodes = 0
+        # Triangular PV array (architecture.md §9.3): `pv[ply]` holds the
+        # principal variation from that ply downward, and `pv_length[ply]`
+        # is the number of valid moves in it.  Updated inside `_negamax`
+        # whenever a new best move is found at a given ply; the root's PV
+        # (`pv[0][:pv_length[0]]`) is the complete, stable principal
+        # variation for the most recently completed depth -- replacing the
+        # old TT-walk approach (`_extract_pv`), which was fragile because
+        # TT entries can be overwritten mid-search.
+        self.pv: list[list[int]] = [[] for _ in range(MAX_PLY + 1)]
+        self.pv_length: list[int] = [0] * (MAX_PLY + 1)
 
     def should_stop(self) -> bool:
         if self.stop_event is not None and self.stop_event.is_set():
@@ -420,7 +430,11 @@ class Search:
                 score = self._aspiration_search(board, depth, prev_score, ctx)
             if ctx.should_stop():
                 break  # partial/unreliable result from an aborted depth: discard entirely
-            pv = self._extract_pv(board, depth)
+            # Read the PV from the triangular PV array (stable, built
+            # inside _negamax as it runs) instead of the old TT-walk
+            # approach (_extract_pv), which was fragile against TT
+            # overwrites producing truncated or stale PV lines.
+            pv = ctx.pv[0][:ctx.pv_length[0]]
             best = SearchResult(pv[0] if pv else best.best_move, score, depth, ctx.nodes, pv)
             prev_score = score
             if on_info is not None:
@@ -507,6 +521,7 @@ class Search:
             # function-definition time would not observe that patch.
             ext_remaining = CHECK_EXTENSION_MAX_PLIES
         ctx.nodes += 1
+        ctx.pv_length[ply] = 0  # no PV yet at this ply; updated below if a best move is found
         if ctx.should_stop():
             return 0  # discarded: caller checks ctx.should_stop()
 
@@ -674,6 +689,10 @@ class Search:
                 return 0
             if score > best_score:
                 best_score, best_move = score, move
+                # Update the triangular PV: this ply's PV is now [move]
+                # followed by the child's PV (from ply+1).
+                ctx.pv[ply] = [move] + ctx.pv[ply + 1][:ctx.pv_length[ply + 1]]
+                ctx.pv_length[ply] = 1 + ctx.pv_length[ply + 1]
             alpha = max(alpha, score)
             if alpha >= beta:
                 self._record_cutoff(move, depth, ply)  # killers/history, §9.4
@@ -763,6 +782,12 @@ class Search:
         self.history[move_from(move)][move_to(move)] += depth * depth
 
     # --- Principal variation extraction (architecture.md §9.3) --------------
+    #
+    # NOTE: `_extract_pv` is no longer called from the main search loop --
+    # the triangular PV array (`ctx.pv[0][:ctx.pv_length[0]]`) replaced it
+    # as the primary PV source (Milestone 5). Kept here for
+    # debugging/testing (e.g. comparing TT-based vs. triangular PV
+    # stability).
 
     def _extract_pv(self, board: Board, depth: int) -> list[int]:
         """Walks the TT from the current position following each node's

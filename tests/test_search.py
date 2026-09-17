@@ -59,6 +59,7 @@ from chessengine.search import (
     CHECK_EXTENSION_MAX_PLIES,
     CHECK_EXTENSION_PLIES,
     Search,
+    SearchInfo,
     SearchLimits,
     _SearchCtx,
     see_ge,
@@ -311,3 +312,71 @@ def test_search_never_returns_null_move_on_immediate_stop(fen: str | None) -> No
         f"fallback move {move_to_uci(result.best_move)!r} is not even legal "
         f"in position {board.to_fen()!r}"
     )
+
+
+# --- 3. Triangular PV stability test (Milestone 5) -------------------------
+
+# Positions chosen to exercise different kinds of PV lines: an opening with
+# many quiet moves, a tactical middlegame with captures/checks, and a
+# pawn-endgame with a clear plan.
+_TRIANGULAR_PV_CASES = [
+    pytest.param(
+        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        id="startpos",
+    ),
+    pytest.param(
+        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
+        id="tactical-middlegame",
+    ),
+    pytest.param(
+        "8/8/4k3/8/8/4K3/4P3/8 w - - 0 1",
+        id="kp-endgame",
+    ),
+    pytest.param(
+        "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+        id="kiwipete",
+    ),
+]
+
+
+@pytest.mark.parametrize("fen", _TRIANGULAR_PV_CASES)
+@pytest.mark.parametrize("depth", [5, 6])
+def test_triangular_pv_at_least_as_long_as_tt_extract_pv(fen: str, depth: int) -> None:
+    """The triangular PV array (built inside _negamax as it runs) should be
+    at least as long as the TT-walk PV (_extract_pv) for the same search,
+    confirming that the triangular approach is more stable -- TT entries can
+    be overwritten during a search, truncating the TT-walk PV, while the
+    triangular array is immune to that."""
+    board = parse_fen(fen)
+    search = Search(default_evaluator())
+    # We need to capture the triangular PV from the last completed depth's
+    # info callback.
+    triangular_pvs: list[list[int]] = []
+
+    def capture_info(info: SearchInfo) -> None:
+        triangular_pvs.append(list(info.pv))
+
+    result = search.search(board, SearchLimits(max_depth=depth), on_info=capture_info)
+
+    # The result PV should itself come from the triangular array.
+    assert result.pv == triangular_pvs[-1], (
+        "SearchResult.pv should match the last on_info PV (both from the triangular array)"
+    )
+
+    # Now extract the TT-based PV for comparison.
+    tt_pv = search._extract_pv(board, depth)
+
+    # The triangular PV must be at least as long as the TT-walk PV.
+    assert len(result.pv) >= len(tt_pv), (
+        f"Triangular PV (len={len(result.pv)}) should be at least as long as "
+        f"the TT-walk PV (len={len(tt_pv)}) for {fen!r} at depth {depth}. "
+        f"Triangular: {[move_to_uci(m) for m in result.pv]}, "
+        f"TT-walk: {[move_to_uci(m) for m in tt_pv]}"
+    )
+
+    # Both must start with the same best move (when non-empty).
+    if result.pv and tt_pv:
+        assert result.pv[0] == tt_pv[0], (
+            f"Triangular and TT-walk PVs disagree on best move: "
+            f"{move_to_uci(result.pv[0])} vs {move_to_uci(tt_pv[0])}"
+        )
