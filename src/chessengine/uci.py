@@ -35,20 +35,27 @@ from .search import Search, SearchInfo, SearchLimits
 
 # --- `go` time/limit token parsing (architecture.md §12) --------------------
 #
-# Time-control math (a fixed fraction of remaining time plus increment,
-# clamped to a safety minimum) is intentionally simple through Milestone 4
-# and isolated entirely here, so it can be refined later without touching
-# `search.py`'s `SearchLimits` contract.
+# Adaptive time management, isolated entirely here so it can be refined
+# without touching `search.py`'s `SearchLimits` contract.
+#
+# The allocation formula estimates how many moves remain in the game and
+# divides the remaining clock accordingly, with adjustments for:
+#   - move number (fewer moves remaining -> larger share per move)
+#   - increment vs. sudden death (no increment -> more conservative)
+#   - safety cap (never spend more than 50% of remaining time on one move)
+#   - minimum allocation (always at least 50ms, with a buffer when near-flagging)
 
 _INT_TOKENS = {"depth", "nodes", "movetime", "wtime", "btime", "winc", "binc"}
 
-_TIME_FRACTION_DIVISOR = 20  # allocate ~1/20th of the remaining clock per move
-_INC_FRACTION_DIVISOR = 2  # plus about half of the increment
-_MOVE_OVERHEAD_MS = 50  # never allocate the *entire* remaining clock
 _MIN_MOVETIME_MS = 50  # safety floor so a near-flagged clock still gets to move
+_NEAR_FLAG_THRESHOLD_MS = 100  # below this we keep a buffer for the clock
+_SAFETY_BUFFER_MS = 50  # buffer kept when near-flagging
+_MAX_TIME_FRACTION = 0.5  # never use more than 50% of remaining time on one move
 
 
-def parse_go_limits(args: list[str], side_to_move: int) -> SearchLimits:
+def parse_go_limits(
+    args: list[str], side_to_move: int, move_number: int = 1
+) -> SearchLimits:
     """Turn `go` command tokens into a `SearchLimits`.
 
     Recognizes `depth`, `nodes`, `movetime`, `wtime`/`btime`/`winc`/`binc`,
@@ -63,6 +70,32 @@ def parse_go_limits(args: list[str], side_to_move: int) -> SearchLimits:
     `wtime`/`btime` (+`winc`/`binc`) time-control math. With none of these,
     `SearchLimits`' own default (`max_depth=64`, unlimited time/nodes) means
     the search runs until an explicit `stop`.
+
+    Time-control math (when wtime/btime are present):
+
+    *With increment*: ``time_left / estimated_moves_remaining + increment``,
+    where ``estimated_moves_remaining = max(20, 40 - move_number)``.  This
+    assumes a typical game lasts ~40 moves with a floor of 20 to avoid
+    over-spending in long endgames.
+
+    *Sudden death (no increment)*: more conservative —
+    ``time_left / max(30, 50 - move_number)`` — keeping a deeper reserve
+    because there is no per-move replenishment.
+
+    Both paths are then clamped by:
+    - a *safety cap* of 50% of remaining time (avoid flagging on a single move),
+    - a *minimum* of 50ms (or ``time_left - 50ms`` when less than 100ms
+      remains, preserving a small buffer for the clock).
+
+    Parameters
+    ----------
+    args : list[str]
+        The tokens after ``go`` on the UCI command line.
+    side_to_move : int
+        ``WHITE`` or ``BLACK`` — selects wtime/winc vs. btime/binc.
+    move_number : int
+        The current full-move number (from ``board.fullmove_number``),
+        used to estimate how many moves remain in the game.
     """
     limits = SearchLimits()
     wtime = btime = winc = binc = movetime = None
@@ -103,9 +136,29 @@ def parse_go_limits(args: list[str], side_to_move: int) -> SearchLimits:
     my_time = wtime if side_to_move == WHITE else btime
     my_inc = (winc if side_to_move == WHITE else binc) or 0
     if my_time is not None:
-        allocated = my_time // _TIME_FRACTION_DIVISOR + my_inc // _INC_FRACTION_DIVISOR
-        safety_cap = max(my_time - _MOVE_OVERHEAD_MS, _MIN_MOVETIME_MS)
-        limits.movetime_ms = max(min(allocated, safety_cap), _MIN_MOVETIME_MS)
+        if my_inc > 0:
+            # With increment: divide remaining time by estimated moves left,
+            # then add the full increment (we'll get it back next move).
+            est_moves = max(20, 40 - move_number)
+            allocated = my_time / est_moves + my_inc
+        else:
+            # Sudden death: no increment to replenish, so be more
+            # conservative with a higher divisor and deeper floor.
+            est_moves = max(30, 50 - move_number)
+            allocated = my_time / est_moves
+
+        # Safety cap: never spend more than 50% of remaining time.
+        safety_cap = my_time * _MAX_TIME_FRACTION
+        allocated = min(allocated, safety_cap)
+
+        # Minimum allocation: at least 50ms, but if near-flagging
+        # (< 100ms left), keep a small buffer for the clock.
+        if my_time < _NEAR_FLAG_THRESHOLD_MS:
+            min_alloc = max(my_time - _SAFETY_BUFFER_MS, 1)
+        else:
+            min_alloc = _MIN_MOVETIME_MS
+
+        limits.movetime_ms = max(int(allocated), min_alloc)
 
     return limits
 
@@ -252,7 +305,9 @@ class UCIEngine:
             out.flush()
             return
 
-        limits = parse_go_limits(args, self.board.side_to_move)
+        limits = parse_go_limits(
+            args, self.board.side_to_move, self.board.fullmove_number
+        )
         self.stop_event = threading.Event()
         self.search_thread = threading.Thread(
             target=self._search_and_report, args=(limits, out), daemon=True

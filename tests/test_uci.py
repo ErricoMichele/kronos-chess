@@ -227,3 +227,112 @@ def test_go_depth_10_from_startpos_uses_book_and_returns_fast() -> None:
     # branch), matching the "no real search ran" claim above directly rather
     # than only inferring it from timing.
     assert engine.search_thread is None
+
+
+# --- Adaptive time management (Milestone 5) --------------------------------
+
+
+from chessengine.constants import WHITE, BLACK
+from chessengine.uci import parse_go_limits
+
+
+def test_time_management_normal_game_with_increment() -> None:
+    """go wtime 60000 btime 60000 winc 1000 binc 1000 at move 1 (fresh game).
+
+    With 60s on the clock and 1s increment, the formula gives:
+        est_moves = max(20, 40 - 1) = 39
+        allocated = 60000 / 39 + 1000 ~= 2538ms
+    This should be in a reasonable range (1000-5000ms).
+    """
+    args = "wtime 60000 btime 60000 winc 1000 binc 1000".split()
+    limits = parse_go_limits(args, WHITE, move_number=1)
+    assert limits.movetime_ms is not None
+    assert 1000 <= limits.movetime_ms <= 5000, (
+        f"Expected 1000-5000ms for a fresh game with 60s+1s, got {limits.movetime_ms}ms"
+    )
+
+
+def test_time_management_low_time_capped() -> None:
+    """go wtime 1000 btime 60000 — White has only 1s left.
+
+    The safety cap (50% of remaining time) limits allocation to at most
+    500ms, regardless of what the base formula would produce.
+    """
+    args = "wtime 1000 btime 60000".split()
+    limits = parse_go_limits(args, WHITE, move_number=1)
+    assert limits.movetime_ms is not None
+    assert limits.movetime_ms <= 500, (
+        f"Expected at most 500ms (50% of 1000ms), got {limits.movetime_ms}ms"
+    )
+
+
+def test_time_management_very_low_time_minimum_allocation() -> None:
+    """go wtime 100 btime 60000 — White is near-flagging with only 100ms.
+
+    At exactly 100ms the normal minimum (50ms) applies.  Below 100ms,
+    the near-flag logic kicks in and keeps a buffer.
+    """
+    args = "wtime 100 btime 60000".split()
+    limits = parse_go_limits(args, WHITE, move_number=1)
+    assert limits.movetime_ms is not None
+    assert limits.movetime_ms >= 1, "Must allocate at least 1ms"
+    assert limits.movetime_ms <= 50, (
+        f"Expected at most 50ms (50% of 100ms cap), got {limits.movetime_ms}ms"
+    )
+
+    # Even more extreme: only 60ms left.
+    args2 = "wtime 60 btime 60000".split()
+    limits2 = parse_go_limits(args2, WHITE, move_number=1)
+    assert limits2.movetime_ms is not None
+    assert limits2.movetime_ms >= 1
+    assert limits2.movetime_ms <= 30, (
+        f"Expected at most 30ms (50% of 60ms), got {limits2.movetime_ms}ms"
+    )
+
+
+def test_time_management_sudden_death_more_conservative() -> None:
+    """go wtime 60000 btime 60000 — no increment (sudden death).
+
+    Without increment, the formula uses a higher divisor:
+        est_moves = max(30, 50 - 1) = 49
+        allocated = 60000 / 49 ~= 1224ms
+    This should be noticeably less than the same position with increment.
+    """
+    args_no_inc = "wtime 60000 btime 60000".split()
+    limits_no_inc = parse_go_limits(args_no_inc, WHITE, move_number=1)
+
+    args_with_inc = "wtime 60000 btime 60000 winc 1000 binc 1000".split()
+    limits_with_inc = parse_go_limits(args_with_inc, WHITE, move_number=1)
+
+    assert limits_no_inc.movetime_ms is not None
+    assert limits_with_inc.movetime_ms is not None
+
+    # Sudden death should allocate strictly less than with increment.
+    assert limits_no_inc.movetime_ms < limits_with_inc.movetime_ms, (
+        f"Sudden death ({limits_no_inc.movetime_ms}ms) should be more conservative "
+        f"than with increment ({limits_with_inc.movetime_ms}ms)"
+    )
+
+    # Sanity: sudden death allocation should still be reasonable.
+    assert 500 <= limits_no_inc.movetime_ms <= 3000, (
+        f"Expected 500-3000ms for sudden death with 60s, got {limits_no_inc.movetime_ms}ms"
+    )
+
+
+def test_time_management_does_not_affect_movetime() -> None:
+    """go movetime X must pass through unchanged regardless of move_number."""
+    args = "movetime 5000".split()
+    limits = parse_go_limits(args, WHITE, move_number=20)
+    assert limits.movetime_ms == 5000
+
+
+def test_time_management_does_not_affect_depth_or_infinite() -> None:
+    """go depth X and go infinite must be unaffected by the new logic."""
+    args_depth = "depth 6".split()
+    limits_depth = parse_go_limits(args_depth, WHITE, move_number=10)
+    assert limits_depth.max_depth == 6
+    assert limits_depth.movetime_ms is None
+
+    args_inf = "infinite".split()
+    limits_inf = parse_go_limits(args_inf, WHITE, move_number=10)
+    assert limits_inf.movetime_ms is None
