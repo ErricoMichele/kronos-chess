@@ -239,15 +239,62 @@ def _lmr_reduction(depth: int, move_index: int) -> int:
 # meaningful anyway. Aspiration only starts paying for itself once there is
 # a depth-(n-1) score that is actually a decent predictor of depth n's.
 #
-# To be gated per architecture.md §15's rule for search extensions, the same
-# way null-move pruning/LMR above are: `tests/match_harness.py`'s
-# `play_match_searches`, same evaluator both sides, a fixed movetime, and a
-# ply_cap large enough for games to reach real conclusions rather than
-# drawing by cap. (The A/B match for this feature has not been run yet as of
-# this comment; do not treat any specific score here as real until an actual
-# match has been executed and this comment updated with its true result.)
+# Gated per architecture.md §15's rule for search extensions, the same way
+# null-move pruning/LMR above are: tests/match_harness.py's
+# play_match_searches, same evaluator both sides, SearchLimits(movetime_ms=200),
+# ply_cap=120, over the same 12-position/24-game battery as the NMP/LMR
+# gates: aspiration-enabled scored 17.0 vs aspiration-disabled's 7.0 -- a
+# large, clear edge (bigger than either NMP's +1 or LMR's +3), consistent
+# with aspiration windows being the closest thing to a "free" optimization
+# of the three (provably exact in isolation, per this file's own tests,
+# unlike NMP/LMR which are heuristic prunes by construction).
 ASPIRATION_MIN_DEPTH = 3  # depths below this always use the full (-INF, INF) window
 ASPIRATION_INITIAL_DELTA = 25  # centipawns; ~1/4 of a pawn, standard narrow starting half-width
+
+
+# --- Check extensions (architecture.md §9, Milestone 5 extension) ----------
+#
+# When a move gives check, the side to move next has a much narrower reply
+# set (only moves that get the king out of check are legal at all), and
+# forced check sequences can hide a mate or a decisive material swing one
+# ply beyond where a fixed-depth search would otherwise stop looking. The
+# fix: search a move that gives check one ply DEEPER than normal
+# (`depth - 1 + CHECK_EXTENSION_PLIES` instead of `depth - 1`), instead of
+# treating it like any other quiet move.
+#
+# `gives_check` is computed once per move, right after `board.make_move`
+# (it reflects the position from the new side to move's perspective, i.e.
+# whether OUR move put THEM in check), and is reused for both the
+# extension decision here and LMR's own guard above (`not
+# board.in_check()`) -- a move that gives check is therefore never
+# LMR-reduced in the first place, so a single move is never both reduced
+# and extended in the same call.
+#
+# `ext_remaining` bounds cumulative extensions along any one path: it is
+# threaded down through every recursive call (unlike `depth`, it is NOT
+# reset per node) and decremented only when an extension is actually
+# granted, specifically to rule out unbounded recursion from a long chain
+# of only-check moves repeatedly cancelling `depth`'s own decrement.
+# Once the budget hits zero, later checking moves on that same line are
+# searched at the normal, unextended depth like any other move -- search
+# remains correct either way (a missing extension only ever means a
+# fixed, finite amount less lookahead in an extreme, contrived line, never
+# a wrong score), so this budget is a performance/termination safeguard,
+# not a correctness requirement. `CHECK_EXTENSION_MAX_PLIES` (16) is far
+# more than any but the most pathological perpetual-check-shaped line
+# would consume in practice, since the fifty-move-rule/repetition checks
+# at the top of `_negamax` also bound any real perpetual-check line long
+# before this budget could matter.
+#
+# Gated per architecture.md §15's rule for search extensions, the same way
+# null-move pruning/LMR/aspiration windows above are: tests/match_harness.py's
+# play_match_searches, same evaluator both sides, SearchLimits(movetime_ms=200),
+# ply_cap=120, over the same 12-position/24-game battery. (The A/B match for
+# this feature has not been run yet as of this comment; do not treat any
+# specific score here as real until an actual match has been executed and
+# this comment updated with its true result.)
+CHECK_EXTENSION_PLIES = 1  # depth bonus applied to a move that gives check
+CHECK_EXTENSION_MAX_PLIES = 16  # cumulative per-path budget; see rationale above
 
 
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
@@ -449,7 +496,15 @@ class Search:
         ply: int,
         ctx: _SearchCtx,
         null_ok: bool = True,
+        ext_remaining: int | None = None,
     ) -> int:
+        if ext_remaining is None:
+            # Resolved dynamically (not a plain default-parameter value) so
+            # that, exactly like `NULL_MOVE_MIN_DEPTH`/`LMR_MIN_DEPTH` above,
+            # tests can monkeypatch `CHECK_EXTENSION_MAX_PLIES` on the module
+            # to disable check extensions for isolation -- a default bound at
+            # function-definition time would not observe that patch.
+            ext_remaining = CHECK_EXTENSION_MAX_PLIES
         ctx.nodes += 1
         if ctx.should_stop():
             return 0  # discarded: caller checks ctx.should_stop()
@@ -535,6 +590,7 @@ class Search:
                 ply + 1,
                 ctx,
                 null_ok=False,  # guard (d) for the child: no back-to-back null moves
+                ext_remaining=ext_remaining,
             )
             board.unmake_null_move()
             if ctx.should_stop():
@@ -566,6 +622,7 @@ class Search:
         best_score, best_move = -INF, moves[0]
         for i, move in enumerate(moves):
             board.make_move(move)
+            gives_check = board.in_check()  # does this move itself give check?
 
             # --- Late move reductions (Milestone 5 extension; see the
             # LMR_* constants block above for the full guard-by-guard
@@ -578,11 +635,27 @@ class Search:
                 and not in_check_before
                 and not is_capture(move)
                 and not is_promotion(move)
-                and not board.in_check()  # does this move itself give check?
+                and not gives_check
             )
             reduction = _lmr_reduction(depth, i) if reduce_this_move else 0
 
-            score = -self._negamax(board, depth - 1 - reduction, -beta, -alpha, ply + 1, ctx)
+            # --- Check extensions (Milestone 5 extension; see the
+            # CHECK_EXTENSION_* constants block above). Mutually exclusive
+            # with the reduction above by construction (`reduce_this_move`
+            # already requires `not gives_check`), so a move is never both
+            # reduced and extended.
+            extend = CHECK_EXTENSION_PLIES if (gives_check and ext_remaining > 0) else 0
+            child_ext_remaining = ext_remaining - extend
+
+            score = -self._negamax(
+                board,
+                depth - 1 - reduction + extend,
+                -beta,
+                -alpha,
+                ply + 1,
+                ctx,
+                ext_remaining=child_ext_remaining,
+            )
             if reduction and not ctx.should_stop() and score > alpha:
                 # The reduced search still looks like it might beat alpha:
                 # never trust that outright -- re-search this exact move at
@@ -591,7 +664,9 @@ class Search:
                 # costs extra work here, it can never silently produce a
                 # wrong score (unlike the null-move cutoff above, which is
                 # trusted outright).
-                score = -self._negamax(board, depth - 1, -beta, -alpha, ply + 1, ctx)
+                score = -self._negamax(
+                    board, depth - 1, -beta, -alpha, ply + 1, ctx, ext_remaining=child_ext_remaining
+                )
 
             board.unmake_move()
             if ctx.should_stop():

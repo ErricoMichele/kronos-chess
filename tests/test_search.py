@@ -55,7 +55,14 @@ from chessengine.evaluate import default_evaluator
 from chessengine.fen import parse_fen
 from chessengine.move import NULL_MOVE, move_to_uci
 from chessengine.movegen import generate_captures, generate_legal_moves
-from chessengine.search import Search, SearchLimits, _SearchCtx, see_ge
+from chessengine.search import (
+    CHECK_EXTENSION_MAX_PLIES,
+    CHECK_EXTENSION_PLIES,
+    Search,
+    SearchLimits,
+    _SearchCtx,
+    see_ge,
+)
 
 # --- 1. Differential test: Search._negamax vs. a naive, unpruned oracle -----
 
@@ -81,7 +88,9 @@ def _naive_quiescence(board: Board, ply: int) -> int:
     return best
 
 
-def _naive_full_width_negamax(board: Board, depth: int, ply: int = 0) -> int:
+def _naive_full_width_negamax(
+    board: Board, depth: int, ply: int = 0, ext_remaining: int = CHECK_EXTENSION_MAX_PLIES
+) -> int:
     """A deliberately naive reference oracle: full-width negamax with **no**
     alpha-beta window (every legal move at every node is visited to the
     full requested depth, nothing is ever pruned), **no** transposition
@@ -90,10 +99,19 @@ def _naive_full_width_negamax(board: Board, depth: int, ply: int = 0) -> int:
 
     This shares only *what a position's minimax value means* with
     `Search._negamax` (draw scoring, mate scoring relative to `ply`, the
-    same evaluator and the same `see_ge`-gated quiescence at the leaves,
-    §9.5) -- never *how* it is computed. Any divergence between this and
-    `Search._negamax`'s score at the same (position, depth) is therefore a
-    real alpha-beta bug, not a difference in search strategy.
+    same evaluator, the same `see_ge`-gated quiescence at the leaves
+    (§9.5), and the same check-extension depth bonus (Milestone 5
+    extension: a move that gives check is searched `CHECK_EXTENSION_PLIES`
+    deeper, budgeted by `ext_remaining` exactly like `Search._negamax`'s
+    own `ext_remaining` parameter)) -- never *how* it is computed. Check
+    extensions are mirrored here for the same reason SEE filtering is:
+    it's a search-structure change, not a pruning technique, so it can
+    change which depth a subtree is searched to even with zero alpha-beta
+    involved -- an oracle without it would diverge from the engine even
+    with zero real bugs, defeating this test's purpose. Any remaining
+    divergence between this and `Search._negamax`'s score at the same
+    (position, depth) is therefore a real alpha-beta bug, not a difference
+    in search strategy.
     """
     if board.is_fifty_move_draw() or board.is_repetition_draw():
         return DRAW_SCORE
@@ -107,7 +125,9 @@ def _naive_full_width_negamax(board: Board, depth: int, ply: int = 0) -> int:
     best = -INF
     for move in moves:
         board.make_move(move)
-        score = -_naive_full_width_negamax(board, depth - 1, ply + 1)
+        gives_check = board.in_check()
+        extend = CHECK_EXTENSION_PLIES if (gives_check and ext_remaining > 0) else 0
+        score = -_naive_full_width_negamax(board, depth - 1 + extend, ply + 1, ext_remaining - extend)
         board.unmake_move()
         if score > best:
             best = score

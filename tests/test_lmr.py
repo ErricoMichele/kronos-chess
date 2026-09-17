@@ -38,13 +38,19 @@ Three things, matching this file's assigned scope:
       tests/test_aspiration_windows.py, which documents a concrete case
       where this exact equivalence does NOT hold with aspiration windows
       active -- an accepted, understood property of composing two search
-      extensions, not a bug). With aspiration windows factored out this way
-      and the shipped, unconditional re-search in place, this equivalence
-      holds on this file's own tested battery (see that test's own
-      docstring for the exact positions/depths and, critically, independent
-      proof -- via a throwaway, *not shipped* edit that deleted the
-      re-search line during development -- that this same equivalence
-      genuinely breaks without it, for at least two of these exact cases).
+      extensions, not a bug), and with check extensions (added later still)
+      also disabled for the same reason -- a reduced-depth probe and its
+      full-depth re-search can each pick up a different amount of
+      check-extension bonus once the probe depth differs this drastically,
+      which disturbs this specific comparison too (see the module comment
+      above `_SAFETY_NET_STRESS_CASES` for the concrete numbers). With both
+      factored out this way and the shipped, unconditional re-search in
+      place, this equivalence holds on this file's own tested battery (see
+      that test's own docstring for the exact positions/depths and,
+      critically, independent proof -- via a throwaway, *not shipped* edit
+      that deleted the re-search line during development -- that this same
+      equivalence genuinely breaks without it, for at least two of these
+      exact cases).
       This is a regression pin on a tested battery, not a proof that LMR's
       re-search safety net guarantees identical output under an arbitrarily
       extreme reduction in general -- it doesn't (the safety net only
@@ -347,6 +353,23 @@ def _always_bottom_out_reduction(depth: int, move_index: int) -> int:
 # So (ii) == (i) holding below is not a foregone conclusion this patch could
 # never disturb regardless of the safety net -- it demonstrably depends on
 # the real, shipped re-search actually running.
+#
+# Check extensions (added after this evidence was gathered) are ALSO
+# disabled for this specific comparison, for the same reason aspiration
+# windows are: `simple-kp-endgame` at depth 7 was re-checked directly and
+# diverges once check extensions are active (reference alone moves from
+# 160cp/e3f3 to 140cp/e3f2, and stressed lands on yet a third answer,
+# 150cp/e3f3) -- not because the safety net stopped working, but because a
+# reduced-depth probe and its full-depth re-search can each accumulate a
+# *different* amount of check-extension bonus along the way once the probe
+# depth itself differs this drastically (bottoming out at depth 0 vs. a
+# normal 1-2 ply reduction), which changes the true value being compared,
+# not just its precision. With check extensions disabled, both cases match
+# the table above exactly (verified directly). This is the same category of
+# interaction as aspiration windows' own window-dependence (see
+# tests/test_aspiration_windows.py) -- composing two Milestone 5 extensions
+# is validated by A/B playing-strength testing, not bit-for-bit equivalence
+# to a third, unrelated extension held active during an isolation check.
 _SAFETY_NET_STRESS_CASES = [
     pytest.param(OPENING_FEN, 6, id="opening-startpos"),
     pytest.param(KP_ENDGAME_FEN, 7, id="simple-kp-endgame"),
@@ -370,14 +393,23 @@ def test_lmr_re_search_keeps_extreme_reduction_identical_to_unpatched_reference(
     test) make LMR's own reduction decisions window-dependent (see
     tests/test_aspiration_windows.py), which would otherwise make
     `reference` itself vary with the root window and confound what this
-    specific test checks. This is NOT claiming the extreme-patch-vs-
-    reference equivalence holds unconditionally for every depth or with
-    aspiration windows active -- it demonstrably does not (see
+    specific test checks. Check extensions (added later still) are also
+    disabled for both sides here, for the analogous reason: a reduced-depth
+    probe and its full-depth re-search can accumulate different amounts of
+    check-extension bonus once the probe depth differs this drastically,
+    which would confound this test the same way (see the module comment
+    above `_SAFETY_NET_STRESS_CASES` for the concrete numbers). This is NOT
+    claiming the extreme-patch-vs-reference equivalence holds
+    unconditionally for every depth, with aspiration windows active, or
+    with check extensions active -- it demonstrably does not (see
     test_aspiration_windows.py's documented king+pawn-endgame counter-
-    example) -- only that, independent of aspiration windows, LMR's
-    re-search safety net keeps this specific tested battery's answers
-    intact even under a deliberately extreme reduction.
+    example for the first, and the module comment above for the second) --
+    only that, independent of both, LMR's re-search safety net keeps this
+    specific tested battery's answers intact even under a deliberately
+    extreme reduction.
     """
+    monkeypatch.setattr(search_mod, "CHECK_EXTENSION_MAX_PLIES", 0)
+
     board_ref = parse_fen(fen)
     reference = _FullWidthSearch(default_evaluator()).search(board_ref, SearchLimits(max_depth=depth))
     assert board_ref.to_fen() == fen, "reference search must leave the board exactly as it found it"
