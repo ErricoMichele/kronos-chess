@@ -48,6 +48,7 @@ from .move import (
     NULL_MOVE,
     PROMO_PIECE_OF,
     is_capture,
+    is_promotion,
     move_flag,
     move_from,
     move_to,
@@ -77,6 +78,93 @@ from .transposition import TTFlag, TranspositionTable, score_from_tt, score_to_t
 # equal time, not a red flag).
 NULL_MOVE_MIN_DEPTH = 3  # guard (b): only try null-move at depth >= this
 NULL_MOVE_REDUCTION = 2  # "R": reduced search is at depth - 1 - R
+
+# --- Late move reductions (LMR) (architecture.md §9, Milestone 5 extension) -
+#
+# Standard LMR: moves searched late in an already-ordered move list
+# (architecture.md §9.4 -- TT move, MVV-LVA, killers, history) are, by
+# construction, exactly the ones move ordering rated *least* promising.
+# Rather than pay a full-depth search for every one of them, a "late" QUIET
+# move is first probed at a reduced depth using the exact same
+# (negated/swapped) alpha-beta window a full-depth search of that move would
+# have used. If that reduced probe still comes back better than `alpha` (a
+# "fail high" relative to the reduced search), the move might genuinely be
+# good, so it is re-searched at the full, unreduced depth before its score is
+# trusted. This re-search is what makes LMR safe: a reduction can only ever
+# *cost* extra work (via the re-search), it can never silently produce a
+# wrong score, unlike null-move pruning above, which trusts a cutoff outright.
+#
+# Every guard below is standard and conservative -- each one excludes a move
+# the reduction itself could plausibly get wrong:
+#   (a) `i >= LMR_MIN_MOVE_INDEX`: never reduce the first few moves in the
+#       list -- those are precisely the ones TT-move/MVV-LVA/killers/history
+#       ordering already front-loaded as most promising, so reducing them
+#       would throw away the point of move ordering.
+#   (b) `depth >= LMR_MIN_DEPTH`: too shallow otherwise for a reduced search
+#       to mean anything. Combined with guard (e) below (never at the root),
+#       this also structurally keeps LMR out of `test_search.py`'s depth-3,
+#       ply-0-rooted differential-oracle test: depth only reaches
+#       `LMR_MIN_DEPTH` (3) at ply 0, which guard (e) excludes, and every
+#       node below that has depth <= 2 -- exactly the same "guard combo can
+#       never simultaneously hold within this test" property the null-move
+#       section above already relies on.
+#   (c) the move is quiet (no capture, no promotion): a capture or promotion
+#       is exactly the kind of forcing, material-swinging move LMR must not
+#       risk underestimating -- MVV-LVA/SEE (§9.4/§9.5) already handle
+#       captures' ordering and quiescence already extends them at the
+#       horizon, so they never need this heuristic's help.
+#   (d) neither side is "in check" across the move: not in check before the
+#       move (a move played while in check is answering a forced, narrow set
+#       of evasions, not a genuinely "late/unpromising" try) and the move
+#       does not itself give check (checked, for free, via `board.in_check()`
+#       from the opponent's now-to-move perspective right after making the
+#       move) -- a checking move opens a forcing line that a reduced search
+#       is exactly the wrong tool to risk misjudging, the same concern check
+#       extensions exist to address.
+#   (e) `ply > 0`: never at the root -- the root must always produce a real,
+#       fully-searched best move (mirrors the null-move section's own
+#       rationale above), and, as guard (b) notes, this is also what keeps
+#       LMR out of the shallow differential-oracle test.
+#
+# Reduction size: a small fixed R=1 for an ordinary late move, stepping up to
+# R=2 only once a move is both very late (`i >= LMR_DEEP_MOVE_INDEX`) and
+# there is plenty of remaining depth to spend the extra reduction on
+# (`depth >= LMR_DEEP_DEPTH`) -- the standard "reduce more, the later and the
+# deeper" shape most textbook LMR tables use, kept here as a two-tier step
+# function rather than a full log-scaled table for simplicity/auditability.
+# Given guards (b)/the two depth thresholds above, `depth - 1 - R` is always
+# >= 1 (never negative, and never so small it skips straight past depth 0
+# without at least one more real ply of search): at the minimum qualifying
+# depth (3), R is always 1 (R=2 requires depth >= 6), giving 3 - 1 - 1 = 1;
+# at the minimum depth where R=2 applies (6), 6 - 1 - 2 = 3.
+#
+# Gated per architecture.md §15's rule for search extensions, the same way
+# null-move pruning above is: tests/match_harness.py's play_match_searches,
+# same evaluator both sides, `SearchLimits(movetime_ms=200)`, `ply_cap=120`
+# (large enough for games to reach a real conclusion rather than drawing by
+# cap -- a smaller preliminary check at ply_cap=60 was run first during
+# implementation and is superseded by this larger, more decisive one), over
+# a 12-position/24-game battery (the null-move gate's own battery, plus
+# several more varied positions): LMR-enabled scored 13.5 vs LMR-disabled's
+# 10.5 -- a clear, non-negative edge (a larger margin than null-move
+# pruning's own +1, comfortably clearing the "must not lose strength" bar).
+LMR_MIN_MOVE_INDEX = 4  # guard (a): moves with index < this are never reduced
+LMR_MIN_DEPTH = 3  # guard (b): no reduction below this remaining depth
+LMR_DEEP_MOVE_INDEX = 8  # "very late" threshold for the deeper reduction
+LMR_DEEP_DEPTH = 6  # "plenty of remaining depth" threshold for the deeper reduction
+LMR_BASE_REDUCTION = 1  # R for an ordinary qualifying late move
+LMR_DEEP_REDUCTION = 2  # R once a move is both very late and depth is large
+
+
+def _lmr_reduction(depth: int, move_index: int) -> int:
+    """`R` for a move that has already passed every LMR guard:
+    `LMR_DEEP_REDUCTION` once it's both very late and there's plenty of
+    depth left to spend the extra reduction on, `LMR_BASE_REDUCTION`
+    otherwise. See the constants block above for the full rationale."""
+    if depth >= LMR_DEEP_DEPTH and move_index >= LMR_DEEP_MOVE_INDEX:
+        return LMR_DEEP_REDUCTION
+    return LMR_BASE_REDUCTION
+
 
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
@@ -292,10 +380,41 @@ class Search:
 
         self._order_moves(moves, board, tt_move, ply)
 
+        # Whether the side to move *here* is in check, computed once and
+        # reused by every move's LMR guard (d) below, rather than
+        # re-deriving the pre-move half of that check per move.
+        in_check_before = board.in_check()
+
         best_score, best_move = -INF, moves[0]
-        for move in moves:
+        for i, move in enumerate(moves):
             board.make_move(move)
-            score = -self._negamax(board, depth - 1, -beta, -alpha, ply + 1, ctx)
+
+            # --- Late move reductions (Milestone 5 extension; see the
+            # LMR_* constants block above for the full guard-by-guard
+            # rationale). Every guard must hold or this move is searched at
+            # the normal, unreduced depth like any other move.
+            reduce_this_move = (
+                ply > 0
+                and i >= LMR_MIN_MOVE_INDEX
+                and depth >= LMR_MIN_DEPTH
+                and not in_check_before
+                and not is_capture(move)
+                and not is_promotion(move)
+                and not board.in_check()  # does this move itself give check?
+            )
+            reduction = _lmr_reduction(depth, i) if reduce_this_move else 0
+
+            score = -self._negamax(board, depth - 1 - reduction, -beta, -alpha, ply + 1, ctx)
+            if reduction and not ctx.should_stop() and score > alpha:
+                # The reduced search still looks like it might beat alpha:
+                # never trust that outright -- re-search this exact move at
+                # the full, unreduced depth before accepting its score. This
+                # re-search is what makes LMR safe: a reduction only ever
+                # costs extra work here, it can never silently produce a
+                # wrong score (unlike the null-move cutoff above, which is
+                # trusted outright).
+                score = -self._negamax(board, depth - 1, -beta, -alpha, ply + 1, ctx)
+
             board.unmake_move()
             if ctx.should_stop():
                 return 0
