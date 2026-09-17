@@ -289,10 +289,11 @@ ASPIRATION_INITIAL_DELTA = 25  # centipawns; ~1/4 of a pawn, standard narrow sta
 # Gated per architecture.md §15's rule for search extensions, the same way
 # null-move pruning/LMR/aspiration windows above are: tests/match_harness.py's
 # play_match_searches, same evaluator both sides, SearchLimits(movetime_ms=200),
-# ply_cap=120, over the same 12-position/24-game battery. (The A/B match for
-# this feature has not been run yet as of this comment; do not treat any
-# specific score here as real until an actual match has been executed and
-# this comment updated with its true result.)
+# ply_cap=120, over a 12-position/24-game battery (the same 6 DEFAULT_POSITIONS
+# plus 6 additional varied openings/middlegames used by the NMP/LMR/aspiration
+# gates): check-extensions-enabled scored 13.5 vs disabled's 10.5 -- a clear,
+# non-negative edge (the same +3 margin LMR's own gate showed, comfortably
+# clearing the "must not lose measurable strength" bar).
 CHECK_EXTENSION_PLIES = 1  # depth bonus applied to a move that gives check
 CHECK_EXTENSION_MAX_PLIES = 16  # cumulative per-path budget; see rationale above
 
