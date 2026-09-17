@@ -33,11 +33,14 @@ from __future__ import annotations
 from chessengine.board import Board
 from chessengine.constants import NO_PIECE, WHITE, color_of, piece_type_of
 from chessengine.evaluate import (
+    KING_SHIELD_CP_PER_PAWN,
+    KING_ZONE_CP_PER_ATTACKER,
     CompositeEvaluator,
     KNIGHT_PST,
     QUEEN_PST,
     Weights,
     default_evaluator,
+    king_safety_term,
     material_pst_term,
     mobility_term,
 )
@@ -142,9 +145,12 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
 def test_default_evaluator_agrees_with_material_pst_plus_mobility() -> None:
     """`default_evaluator()` enables `material_pst` and `mobility`, both at
     weight 1.0 (the latter validated by an A/B self-play match, see
-    `Weights.mobility`'s docstring comment in evaluate.py) -- so its output
-    must equal the exact sum of the two terms, on every sample position, not
-    just correlate with it."""
+    `Weights.mobility`'s docstring comment in evaluate.py). `king_safety` is
+    registered but disabled at weight 0.0 (its own A/B match did not show a
+    non-negative trend on a fair-sized sample, see `Weights.king_safety`'s
+    docstring comment) and so must contribute nothing -- output must equal
+    the exact sum of just the two enabled terms, on every sample position,
+    not just correlate with it."""
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
@@ -291,17 +297,23 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
 
 
 def test_default_evaluator_enables_material_pst_and_mobility_only() -> None:
-    """`default_evaluator()` enables `material_pst` and `mobility` (the
-    latter validated by an A/B self-play match against a material+PST-only
-    baseline, architecture.md §10.2/§15's gate); `king_safety` and
-    `pawn_structure` remain unimplemented and stay at 0.0 -- pinned down
-    field by field so a future term accidentally left enabled early (or a
-    validated one accidentally left disabled) would fail this test."""
+    """`default_evaluator()` enables `material_pst` and `mobility` at
+    nonzero weight (the latter validated by an A/B self-play match,
+    architecture.md §10.2/§15's gate -- see `Weights.mobility`'s docstring
+    comment). `king_safety` is registered (`king_safety_term` is
+    implemented and unit-tested below) but stays at weight 0.0 -- its own
+    A/B match did not show a non-negative trend on a fair-sized sample, see
+    `Weights.king_safety`'s docstring comment. `pawn_structure` remains
+    fully unimplemented (no entry in `terms` at all) and stays at 0.0 --
+    pinned down field by field so a future term accidentally left enabled
+    early (or a validated one accidentally left disabled/enabled) would
+    fail this test."""
     evaluator = default_evaluator()
 
-    assert set(evaluator.terms) == {"material_pst", "mobility"}
+    assert set(evaluator.terms) == {"material_pst", "mobility", "king_safety"}
     assert evaluator.terms["material_pst"] is material_pst_term
     assert evaluator.terms["mobility"] is mobility_term
+    assert evaluator.terms["king_safety"] is king_safety_term
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
@@ -418,3 +430,126 @@ def test_mobility_term_favors_developed_open_side_regardless_of_side_to_move() -
         f"less mobile side) here, got {score}"
     )
     assert score == -36, f"expected mobility_term == -36 exactly, got {score}"
+
+
+# --- king_safety_term ---------------------------------------------------
+#
+# `king_safety_term` (Milestone 5, gated off via `Weights.king_safety` until
+# its own A/B match -- see the term's module comment and `Weights.king_safety`
+# docstring in evaluate.py) combines a pawn-shield count (own pawns on the 3
+# squares directly in front of the king) with a king-zone-attacker count
+# (enemy pieces attacking any of the 8 squares around the king), scaled by
+# `KING_SHIELD_CP_PER_PAWN` and `KING_ZONE_CP_PER_ATTACKER` respectively.
+# These tests reuse exactly the same `_color_flip_pieces`/`SYMMETRY_FENS`
+# pattern used for `material_pst_term`/`mobility_term` above, rather than
+# inventing a third, parallel mirroring convention.
+
+
+# --- 1. Color-flip symmetry --------------------------------------------------
+
+
+def test_king_safety_term_negates_under_color_flip_mirror() -> None:
+    """`king_safety_term(mirror) == -king_safety_term(original)` for every
+    sample position -- the same color-flip symmetry checked for
+    `material_pst_term`/`mobility_term` above, now for the king-safety term
+    (catches e.g. a pawn-shield direction computed for the wrong color, or a
+    king-zone-attacker count computed against the wrong `by_color`)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        mirror = _color_flip_pieces(board)
+        assert king_safety_term(mirror) == -king_safety_term(board), (
+            f"color-flip symmetry broken for {fen!r}: "
+            f"king_safety_term(original)={king_safety_term(board)}, "
+            f"king_safety_term(mirror)={king_safety_term(mirror)}"
+        )
+
+
+def test_king_safety_term_double_mirror_restores_original_score() -> None:
+    """Mirroring twice is the identity transform on piece placement, so it
+    must also be the identity on `king_safety_term` (a second, independent
+    check on top of the plain negation above)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        double_mirror = _color_flip_pieces(_color_flip_pieces(board))
+        assert king_safety_term(double_mirror) == king_safety_term(board)
+
+
+def test_king_safety_term_zero_for_symmetric_startpos() -> None:
+    """The starting position is perfectly mirror-symmetric -- both kings have
+    an identical (mirrored) 3-pawn shield in front of them, and neither king's
+    zone is attacked by anything (every piece is blocked by its own pawn rank)
+    -- so `king_safety_term` must score exactly 0, not just "small" or
+    "roughly balanced"."""
+    assert king_safety_term(parse_fen(STARTPOS_FEN)) == 0
+
+
+# --- 2. Directional sanity: castled-and-shielded vs. exposed-in-the-center --
+
+
+def test_king_safety_term_favors_castled_shielded_king_over_exposed_king() -> None:
+    """A position where White's king is safely tucked away on g1 behind an
+    intact 3-pawn shield (f2/g2/h2) and totally unbothered, versus Black's
+    king stranded on e5 in the center with no pawn shield at all and four
+    White pieces bearing down on its immediate 8-square king zone, must score
+    `king_safety_term` clearly positive (favoring White, the safer king, who
+    is also the side to move here -- the negamax convention makes a positive
+    score mean "good for the side to move," §10).
+
+    Position (White to move):
+        8  . . . . . . . .
+        7  . . . . . . . .
+        6  . . . . . . . .
+        5  . . . . k . . Q
+        4  . . N . . . . .
+        3  . . . . . . . .
+        2  . B . . . P P P
+        1  . . . . R . K .
+           a b c d e f g h
+
+    White: Kg1 with an intact 3-pawn shield on f2/g2/h2 (shield = 3, +45 cp)
+    and zero enemy pieces attacking its king zone (f1/h1/f2/g2/h2) -- White's
+    own `_king_safety_score` is exactly 3*15 - 0*20 = +45.
+
+    Black: Ke5 with no pawn shield at all (shield = 0) and four White pieces
+    each attacking one distinct square of its 8-square king zone
+    (d4/e4/f4/d5/f5/d6/e6/f6): Bb2->d4, Re1->e4 (blocked by the king itself,
+    same as a real check would be), Qh5->f5 (blocked from going further by
+    the king), and Nc4->d6. That's 4 attackers, so Black's own
+    `_king_safety_score` is exactly 0*15 - 4*20 = -80.
+
+    `king_safety_term` = white_score - black_score = 45 - (-80) = +125,
+    checked exactly (not just ">0"), with every shield pawn and every
+    attacker above counted by hand and independently confirmed against
+    `_king_safety_score`.
+    """
+    fen = "8/8/8/4k2Q/2N5/8/1B3PPP/4R1K1 w - - 0 1"
+    board = parse_fen(fen)
+
+    score = king_safety_term(board)
+    assert score > 0, (
+        f"expected king_safety_term to favor White's castled, shielded king "
+        f"over Black's exposed, attacked king, got {score}"
+    )
+    assert score == 125, f"expected king_safety_term == +125 exactly, got {score}"
+
+    # Sanity-check the hand-derived components directly, so a passing test
+    # can't be an accident of unrelated cancellation.
+    assert KING_SHIELD_CP_PER_PAWN == 15
+    assert KING_ZONE_CP_PER_ATTACKER == 20
+
+
+def test_king_safety_term_favors_castled_shielded_king_regardless_of_side_to_move() -> None:
+    """The same position as above but with the side to move flipped to
+    Black: White's king is still objectively the safer one, so
+    `king_safety_term` (relative to the side to move, i.e. Black here) must
+    flip sign to negative -- confirms the directional result isn't an
+    artifact of which side happens to be on move."""
+    fen = "8/8/8/4k2Q/2N5/8/1B3PPP/4R1K1 b - - 0 1"
+    board = parse_fen(fen)
+
+    score = king_safety_term(board)
+    assert score < 0, (
+        f"expected king_safety_term to disfavor Black (the side to move, and "
+        f"the side with the exposed, attacked king) here, got {score}"
+    )
+    assert score == -125, f"expected king_safety_term == -125 exactly, got {score}"

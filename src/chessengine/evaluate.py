@@ -15,10 +15,22 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .attacks import KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
+from . import attacks
+from .attacks import KING_ATTACKS, KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
 from .bitboard import iter_bits, popcount
 from .board import Board
-from .constants import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
+from .constants import (
+    BISHOP,
+    BLACK,
+    KING,
+    KNIGHT,
+    PAWN,
+    QUEEN,
+    ROOK,
+    WHITE,
+    file_of,
+    rank_of,
+)
 
 
 class Evaluator(Protocol):
@@ -188,6 +200,67 @@ def mobility_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- King safety (Milestone 5, gated off via Weights.king_safety until its --
+# --- own A/B gate) -----------------------------------------------------------
+#
+# Two standard, simple components, combined into one term:
+#
+#   (a) Pawn shield: count of the king's *own* pawns on the 3 squares
+#       directly in front of the king — its file and the two adjacent
+#       files, one rank towards the enemy (rank+1 for White, rank-1 for
+#       Black) — clipped at the board edge, so a king on the a-file or
+#       h-file only ever has 2 possible shield squares, not 3.
+#
+#   (b) King-zone attackers: count of enemy pieces attacking any square in
+#       the king's immediate 8-neighborhood ("king zone"), i.e.
+#       `KING_ATTACKS[king_sq]` — the same leaper table attacks.py already
+#       builds for king moves — via `attacks.attackers_to`, one of
+#       attacks.py's own attacked-square-query primitives (§5.4), against
+#       the board's actual occupancy. This is the same DAG-respecting
+#       pattern `mobility_term` follows above: attacks.py's primitives are
+#       called directly, never movegen.py's side-to-move-bound
+#       pseudo-legal/legal move generation, so this term stays computable
+#       for *both* colors regardless of whose turn it is.
+#
+# Scale: +15 cp per shield pawn, -20 cp per enemy piece attacking a
+# king-zone square (a flat penalty per attacking piece, not weighted by
+# attacker value — a simple, easily-explainable starting point, same spirit
+# as MOBILITY_CP_PER_SQUARE above; a piece attacking several king-zone
+# squares at once is counted once per square it attacks, which is standard
+# for this kind of "attack units" heuristic). Not hand-tuned yet — like
+# mobility_term before it, this is pending its own A/B self-play gate
+# (tests/match_harness.py) before Weights.king_safety moves off 0.0.
+KING_SHIELD_CP_PER_PAWN = 15
+KING_ZONE_CP_PER_ATTACKER = 20
+
+
+def _king_safety_score(board: Board, color: int) -> int:
+    king_sq = board.king_square(color)
+    king_file, king_rank = file_of(king_sq), rank_of(king_sq)
+
+    shield_rank = king_rank + 1 if color == WHITE else king_rank - 1
+    shield = 0
+    if 0 <= shield_rank < 8:
+        own_pawns = board.pieces[color][PAWN]
+        for f in (king_file - 1, king_file, king_file + 1):
+            if 0 <= f < 8:
+                sq = shield_rank * 8 + f
+                if own_pawns & (1 << sq):
+                    shield += 1
+
+    enemy = 1 - color
+    zone_attackers = 0
+    for sq in iter_bits(KING_ATTACKS[king_sq]):
+        zone_attackers += popcount(attacks.attackers_to(board, sq, enemy))
+
+    return shield * KING_SHIELD_CP_PER_PAWN - zone_attackers * KING_ZONE_CP_PER_ATTACKER
+
+
+def king_safety_term(board: Board) -> int:
+    white_score = _king_safety_score(board, WHITE) - _king_safety_score(board, BLACK)
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -200,6 +273,20 @@ class Weights:
     # clear non-negative (in fact strongly positive) trend per the
     # architecture.md §10.2/§15 gate.
     mobility: float = 1.0
+    # Kept at 0.0: the first A/B match (DEFAULT_POSITIONS only, depth 3, 12
+    # games) came back an exact 6.0/12 tie, which was provisionally read as a
+    # non-negative trend and briefly enabled -- but a tie from only 12
+    # (fully deterministic, no-randomness) games is weak evidence either way.
+    # A larger follow-up match (DEFAULT_POSITIONS + 4 independent positions,
+    # same depth, 20 games) came back baseline 10.5 vs king-safety-enabled
+    # 9.5 -- i.e. enabling it *lost* ground once given a fairer sample. Per
+    # architecture.md §10.2/§15 ("a term 'correct' in isolation can still
+    # lose strength through interaction effects"), that's not a term to keep
+    # enabled: `king_safety_term` stays implemented and unit-tested, wired
+    # into `default_evaluator()`'s terms dict, but disabled at 0.0 pending
+    # either a better-tuned scale (KING_SHIELD_CP_PER_PAWN/
+    # KING_ZONE_CP_PER_ATTACKER above are still just a reasonable first
+    # guess) or a larger/deeper re-gate.
     king_safety: float = 0.0
     pawn_structure: float = 0.0
 
@@ -223,12 +310,17 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """Material+PST and mobility are both enabled. `mobility_term` passed its
-    A/B gate (see `Weights.mobility`'s docstring comment above) and is kept
-    at its validated weight; king_safety/pawn_structure remain unimplemented
-    (Weights defaults to 0.0 for those) until their own terms and A/B gates
-    land."""
+    """Material+PST and mobility are enabled; `mobility_term` passed its A/B
+    gate (see `Weights.mobility`'s docstring comment above). `king_safety`
+    is registered (wired in, unit-tested) but disabled at weight 0.0 -- its
+    A/B match did not show a non-negative trend on a fair-sized sample (see
+    `Weights.king_safety`'s docstring comment above). `pawn_structure`
+    remains unimplemented entirely."""
     return CompositeEvaluator(
-        terms={"material_pst": material_pst_term, "mobility": mobility_term},
-        weights=Weights(material_pst=1.0, mobility=1.0),
+        terms={
+            "material_pst": material_pst_term,
+            "mobility": mobility_term,
+            "king_safety": king_safety_term,
+        },
+        weights=Weights(material_pst=1.0, mobility=1.0, king_safety=0.0),
     )
