@@ -15,7 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
-from .bitboard import iter_bits
+from .attacks import KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
+from .bitboard import iter_bits, popcount
 from .board import Board
 from .constants import BISHOP, BLACK, KING, KNIGHT, PAWN, QUEEN, ROOK, WHITE
 
@@ -138,13 +139,67 @@ def material_pst_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- Mobility (Milestone 5, enabled via Weights.mobility after its A/B gate) -
+#
+# "Mobility" for a color is the total count of squares attacked by that
+# color's knights/bishops/rooks/queens (pawns and king are excluded: pawn
+# "attacks" are captures rather than mobility in the usual sense, and king
+# attacks are near-constant and already the concern of a separate king-safety
+# term). This calls attacks.py's attack-table primitives directly — the
+# knight leaper table plus bishop_attacks/rook_attacks/queen_attacks against
+# the board's full `occupied` bitboard — rather than movegen.py's
+# pseudo-legal/legal move generation, because movegen.py only ever generates
+# moves for `board.side_to_move`; this term must be computable for *both*
+# colors regardless of whose turn it is (following the same DAG-respecting
+# pattern as material_pst_term, just reaching one module further upstream to
+# attacks.py, which is still strictly before evaluate.py in the dependency
+# order per architecture.md §11: constants/bitboard -> attacks -> board ->
+# ... -> evaluate).
+#
+# Scale: 3 centipawns per extra attacked square, the middle of the commonly
+# used ~2-5 cp/square range for a simple attacked-square-count mobility term
+# (finer per-piece-type mobility tables exist, e.g. PeSTO-style, but a flat
+# per-square value is a reasonable, easily-explainable starting point). This
+# scale was deliberately not hand-tuned before being validated: an A/B
+# self-play match (tests/match_harness.py, DEFAULT_POSITIONS, depth 3) against
+# a material+PST-only baseline scored 9.0/12 vs 3.0/12 at Weights.mobility=1.0,
+# a clear non-negative trend, so it's kept at that weight below.
+MOBILITY_CP_PER_SQUARE = 3
+
+
+def _side_mobility(board: Board, color: int) -> int:
+    occ = board.occupied
+    p = board.pieces[color]
+    total = 0
+    for sq in iter_bits(p[KNIGHT]):
+        total += popcount(KNIGHT_ATTACKS[sq])
+    for sq in iter_bits(p[BISHOP]):
+        total += popcount(bishop_attacks(sq, occ))
+    for sq in iter_bits(p[ROOK]):
+        total += popcount(rook_attacks(sq, occ))
+    for sq in iter_bits(p[QUEEN]):
+        total += popcount(queen_attacks(sq, occ))
+    return total
+
+
+def mobility_term(board: Board) -> int:
+    white_mobility_squares = _side_mobility(board, WHITE) - _side_mobility(board, BLACK)
+    white_score = white_mobility_squares * MOBILITY_CP_PER_SQUARE
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
 @dataclass
 class Weights:
     material_pst: float = 1.0
-    mobility: float = 0.0  # 0.0 until Milestone 5 implements the term
+    # Enabled at 1.0 per an A/B self-play match against a material+PST-only
+    # baseline (tests/match_harness.py, DEFAULT_POSITIONS, depth 3): the
+    # mobility-enabled candidate scored 9.0/12 vs the baseline's 3.0/12, a
+    # clear non-negative (in fact strongly positive) trend per the
+    # architecture.md §10.2/§15 gate.
+    mobility: float = 1.0
     king_safety: float = 0.0
     pawn_structure: float = 0.0
 
@@ -168,5 +223,12 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """The Milestone 2/3/4 evaluator: material+PST only."""
-    return CompositeEvaluator(terms={"material_pst": material_pst_term}, weights=Weights(material_pst=1.0))
+    """Material+PST and mobility are both enabled. `mobility_term` passed its
+    A/B gate (see `Weights.mobility`'s docstring comment above) and is kept
+    at its validated weight; king_safety/pawn_structure remain unimplemented
+    (Weights defaults to 0.0 for those) until their own terms and A/B gates
+    land."""
+    return CompositeEvaluator(
+        terms={"material_pst": material_pst_term, "mobility": mobility_term},
+        weights=Weights(material_pst=1.0, mobility=1.0),
+    )

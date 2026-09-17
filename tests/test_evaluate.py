@@ -39,6 +39,7 @@ from chessengine.evaluate import (
     Weights,
     default_evaluator,
     material_pst_term,
+    mobility_term,
 )
 from chessengine.fen import STARTPOS_FEN, parse_fen
 
@@ -138,15 +139,16 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
         )
 
 
-def test_default_evaluator_agrees_with_material_pst_term() -> None:
-    """`default_evaluator()` is documented (architecture.md §10.2) as
-    material+PST only, weight 1.0 -- so its output must equal
-    `material_pst_term` exactly, on every sample position, not just
-    correlate with it."""
+def test_default_evaluator_agrees_with_material_pst_plus_mobility() -> None:
+    """`default_evaluator()` enables `material_pst` and `mobility`, both at
+    weight 1.0 (the latter validated by an A/B self-play match, see
+    `Weights.mobility`'s docstring comment in evaluate.py) -- so its output
+    must equal the exact sum of the two terms, on every sample position, not
+    just correlate with it."""
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
-        assert evaluator.evaluate(board) == material_pst_term(board)
+        assert evaluator.evaluate(board) == material_pst_term(board) + mobility_term(board)
 
 
 # --- 2. Material term sanity: an extra queen is worth about +900 ------------
@@ -288,17 +290,131 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
     assert evaluator.evaluate(board) == material_pst_term(board)
 
 
-def test_default_evaluator_enables_only_material_pst() -> None:
-    """`default_evaluator()` is the Milestone 2/3/4 evaluator: material+PST
-    only, weight 1.0, every other documented term at weight 0.0
-    (architecture.md §10.2) -- pinned down field by field so a future
-    Milestone 5 term accidentally left enabled early would fail this test."""
+def test_default_evaluator_enables_material_pst_and_mobility_only() -> None:
+    """`default_evaluator()` enables `material_pst` and `mobility` (the
+    latter validated by an A/B self-play match against a material+PST-only
+    baseline, architecture.md §10.2/§15's gate); `king_safety` and
+    `pawn_structure` remain unimplemented and stay at 0.0 -- pinned down
+    field by field so a future term accidentally left enabled early (or a
+    validated one accidentally left disabled) would fail this test."""
     evaluator = default_evaluator()
 
-    assert set(evaluator.terms) == {"material_pst"}
+    assert set(evaluator.terms) == {"material_pst", "mobility"}
     assert evaluator.terms["material_pst"] is material_pst_term
+    assert evaluator.terms["mobility"] is mobility_term
 
     assert evaluator.weights.material_pst == 1.0
-    assert evaluator.weights.mobility == 0.0
+    assert evaluator.weights.mobility == 1.0
     assert evaluator.weights.king_safety == 0.0
     assert evaluator.weights.pawn_structure == 0.0
+
+
+# --- mobility_term ------------------------------------------------------
+#
+# `mobility_term` (architecture.md §10.1's Milestone 5 extension path, wired
+# into `default_evaluator()` at weight 1.0 after passing its A/B gate -- see
+# `evaluate.py`'s own module docstring above `mobility_term`) counts total
+# attacked squares for knights/bishops/rooks/queens only (pawns and king are
+# deliberately excluded), scaled by `MOBILITY_CP_PER_SQUARE`. These tests
+# reuse exactly the same `_color_flip_pieces`/`SYMMETRY_FENS` pattern used
+# for `material_pst_term` above, rather than inventing a second, parallel
+# mirroring convention.
+
+
+# --- 1. Color-flip symmetry --------------------------------------------------
+
+
+def test_mobility_term_negates_under_color_flip_mirror() -> None:
+    """`mobility_term(mirror) == -mobility_term(original)` for every sample
+    position -- the same color-flip symmetry checked for `material_pst_term`
+    above, now for the mobility term (catches e.g. a knight/bishop/rook/queen
+    attack count computed for the wrong color, or a mirror that doesn't
+    flip occupancy consistently)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        mirror = _color_flip_pieces(board)
+        assert mobility_term(mirror) == -mobility_term(board), (
+            f"color-flip symmetry broken for {fen!r}: "
+            f"mobility_term(original)={mobility_term(board)}, "
+            f"mobility_term(mirror)={mobility_term(mirror)}"
+        )
+
+
+def test_mobility_term_double_mirror_restores_original_score() -> None:
+    """Mirroring twice is the identity transform on piece placement, so it
+    must also be the identity on `mobility_term` (a second, independent
+    check on top of the plain negation above)."""
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        double_mirror = _color_flip_pieces(_color_flip_pieces(board))
+        assert mobility_term(double_mirror) == mobility_term(board)
+
+
+def test_mobility_term_zero_for_symmetric_startpos() -> None:
+    """The starting position is perfectly mirror-symmetric -- both sides
+    have identical knights/bishops/rooks/queens on identical (mirrored)
+    squares with identical (mirrored) blockers -- so `mobility_term` must
+    score exactly 0, not just "small" or "roughly balanced"."""
+    assert mobility_term(parse_fen(STARTPOS_FEN)) == 0
+
+
+# --- 2. Directional sanity: developed/open vs. boxed-in-by-own-pawns --------
+
+
+def test_mobility_term_favors_developed_open_side_over_boxed_in_side() -> None:
+    """A position with the same minor-piece material on both sides, but
+    White's knight/bishop developed to open, central/long-diagonal squares
+    versus Black's knight/bishop still on the back rank and boxed in by
+    Black's own pawns, must score `mobility_term` clearly positive (favoring
+    White, the more mobile side, who is also the side to move here -- the
+    negamax convention makes a positive score mean "good for the side to
+    move," §10).
+
+    Position (White to move):
+        8  n . b . k . . .
+        7  . p . p . . . .
+        6  . . . . . . . .
+        5  . . . . . . . .
+        4  . . . N . . . .
+        3  . . . . . . . .
+        2  . . . . . . B .
+        1  . . . . K . . .
+           a b c d e f g h
+
+    White: Nd4 (central -- all 8 knight-attack squares on-board) and Bg2
+    (fianchettoed on the long diagonal, only blocked far down it by Black's
+    own b7 pawn) = 8 + 8 = 16 attacked squares.
+    Black: Na8 (cornered -- only 2 of the 8 knight-attack squares are
+    on-board) and Bc8 (still on the back rank, boxed in immediately by its
+    own b7/d7 pawns one square out on each open diagonal) = 2 + 2 = 4
+    attacked squares.
+
+    Expected diff: (16 - 4) * MOBILITY_CP_PER_SQUARE(=3) = +36, exactly --
+    checked exactly (not just ">0") since every attacked square above was
+    counted by hand and independently confirmed against `_side_mobility`.
+    """
+    fen = "n1b1k3/1p1p4/8/8/3N4/8/6B1/4K3 w - - 0 1"
+    board = parse_fen(fen)
+
+    score = mobility_term(board)
+    assert score > 0, (
+        f"expected mobility_term to favor the developed/open White side, got {score}"
+    )
+    assert score == 36, f"expected mobility_term == +36 exactly, got {score}"
+
+
+def test_mobility_term_favors_developed_open_side_regardless_of_side_to_move() -> None:
+    """The same position as above but with the side to move flipped to
+    Black: White is still objectively the more mobile side, so `mobility_term`
+    (relative to the side to move, i.e. Black here) must flip sign to
+    negative -- confirms the directional result isn't an artifact of which
+    side happens to be on move."""
+    fen = "n1b1k3/1p1p4/8/8/3N4/8/6B1/4K3 b - - 0 1"
+    board = parse_fen(fen)
+
+    score = mobility_term(board)
+    assert score < 0, (
+        f"expected mobility_term to disfavor Black (the side to move, and the "
+        f"less mobile side) here, got {score}"
+    )
+    assert score == -36, f"expected mobility_term == -36 exactly, got {score}"
