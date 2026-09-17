@@ -31,14 +31,27 @@ Three things, matching this file's assigned scope:
       always bottom every qualifying move out at a depth-0 (quiescence-only)
       probe, far more aggressive than production's 1-or-2-ply reduction, and
       the resulting score/best-move is compared against a plain reference
-      search of the exact same position/depth with no monkeypatching at all.
-      With the shipped, unconditional re-search in place, this equivalence
-      holds everywhere it was checked while writing this file (see that
-      test's own docstring for the exact positions/depths and, critically,
-      independent proof -- via a throwaway, *not shipped* edit that deleted
-      the re-search line during development -- that this same equivalence
+      search of the exact same position/depth with no monkeypatching at all
+      -- both sides using `_FullWidthSearch` (aspiration windows disabled),
+      not plain `Search`, once aspiration windows were added later and made
+      LMR's own reduction decisions window-dependent (see
+      tests/test_aspiration_windows.py, which documents a concrete case
+      where this exact equivalence does NOT hold with aspiration windows
+      active -- an accepted, understood property of composing two search
+      extensions, not a bug). With aspiration windows factored out this way
+      and the shipped, unconditional re-search in place, this equivalence
+      holds on this file's own tested battery (see that test's own
+      docstring for the exact positions/depths and, critically, independent
+      proof -- via a throwaway, *not shipped* edit that deleted the
+      re-search line during development -- that this same equivalence
       genuinely breaks without it, for at least two of these exact cases).
-      That is the literal "a reduced-depth search for some late move would
+      This is a regression pin on a tested battery, not a proof that LMR's
+      re-search safety net guarantees identical output under an arbitrarily
+      extreme reduction in general -- it doesn't (the safety net only
+      catches a reduced move that scores *better* than the current node's
+      alpha; a sufficiently extreme reduction can still under-value a
+      genuinely good move without ever crossing that threshold, so it's
+      never re-searched at all). That is the literal "a reduced-depth search for some late move would
       look bad at reduced depth, but the engine still finds the right answer
       at full search" scenario this task asks for, just demonstrated via the
       one clean seam LMR's implementer actually factored out (`_lmr_reduction`)
@@ -77,7 +90,23 @@ from chessengine.evaluate import default_evaluator
 from chessengine.fen import parse_fen
 from chessengine.move import NULL_MOVE, is_capture, is_promotion, move_to_uci
 from chessengine.movegen import generate_captures, generate_legal_moves
+from chessengine.constants import INF
 from chessengine.search import Search, SearchLimits, see_ge
+
+
+class _FullWidthSearch(Search):
+    """Comparison-only variant used by the extreme-reduction stress test
+    below: forces the plain `(-INF, INF)` window at every depth, i.e.
+    aspiration windows (a separate Milestone 5 extension, added after this
+    stress test was originally written) held disabled. This isolates "does
+    an extreme LMR reduction patch still match a full-width reference" from
+    aspiration windows' own, independently-tested window-dependence effect
+    on LMR (see tests/test_aspiration_windows.py) -- without this, `Search`'s
+    now-unconditional aspiration windows would make `reference` itself
+    window-dependent too, confounding what this test is actually checking."""
+
+    def _aspiration_search(self, board, depth, prev_score, ctx):
+        return self._negamax(board, depth, -INF, INF, 0, ctx)
 from chessengine import search as search_mod
 
 # --- Shared FEN fixtures ------------------------------------------------------
@@ -335,14 +364,27 @@ def test_lmr_re_search_keeps_extreme_reduction_identical_to_unpatched_reference(
     patched to the extreme, always-bottom-out-at-quiescence probe above, the
     shipped, unconditional re-search keeps the final answer identical to a
     plain, unpatched reference search of the same position/depth.
+
+    Uses `_FullWidthSearch` (aspiration windows disabled) for BOTH sides of
+    the comparison, not plain `Search`: aspiration windows (added after this
+    test) make LMR's own reduction decisions window-dependent (see
+    tests/test_aspiration_windows.py), which would otherwise make
+    `reference` itself vary with the root window and confound what this
+    specific test checks. This is NOT claiming the extreme-patch-vs-
+    reference equivalence holds unconditionally for every depth or with
+    aspiration windows active -- it demonstrably does not (see
+    test_aspiration_windows.py's documented king+pawn-endgame counter-
+    example) -- only that, independent of aspiration windows, LMR's
+    re-search safety net keeps this specific tested battery's answers
+    intact even under a deliberately extreme reduction.
     """
     board_ref = parse_fen(fen)
-    reference = Search(default_evaluator()).search(board_ref, SearchLimits(max_depth=depth))
+    reference = _FullWidthSearch(default_evaluator()).search(board_ref, SearchLimits(max_depth=depth))
     assert board_ref.to_fen() == fen, "reference search must leave the board exactly as it found it"
 
     monkeypatch.setattr(search_mod, "_lmr_reduction", _always_bottom_out_reduction)
     board_stress = parse_fen(fen)
-    stressed = Search(default_evaluator()).search(board_stress, SearchLimits(max_depth=depth))
+    stressed = _FullWidthSearch(default_evaluator()).search(board_stress, SearchLimits(max_depth=depth))
     assert board_stress.to_fen() == fen, "stressed search must leave the board exactly as it found it"
 
     assert stressed.best_move == reference.best_move, (

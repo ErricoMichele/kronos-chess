@@ -166,6 +166,90 @@ def _lmr_reduction(depth: int, move_index: int) -> int:
     return LMR_BASE_REDUCTION
 
 
+# --- Aspiration windows (architecture.md §9.3, Milestone 5 extension) ------
+#
+# Standard aspiration windows: once iterative deepening has a previous
+# completed depth's score to work with, the next (deeper) iteration is first
+# tried with a NARROW window centered on that score (`Search._aspiration_
+# search`, called from `Search.search`'s own loop below) instead of the full
+# `(-INF, INF)` window every depth used before this. Successive
+# iterative-deepening scores usually move smoothly from one depth to the
+# next, so a window only `ASPIRATION_INITIAL_DELTA` centipawns wide around
+# the last depth's score still contains the truth almost all the time -- and
+# a narrower window lets alpha-beta cut off far more of the tree to *prove*
+# that, for the identical final answer, in less time.
+#
+# In ISOLATION -- i.e. plain alpha-beta + TT, with null-move pruning/LMR
+# both held disabled -- this is a pure speed optimization, exact rather than
+# a heuristic: `_negamax`'s `(alpha, beta)` window is advisory, never
+# authoritative, so handing it a too-narrow window can only ever make it
+# return an inexact *bound* (`score <= alpha`, a "fail low", or `score >=
+# beta`, a "fail high"; see its own `TTFlag` classification at the bottom of
+# `_negamax`, `EXACT` iff `alpha_orig < best_score < beta`), never a wrong
+# exact score. `Search._aspiration_search` treats exactly those two cases as
+# "not yet trustworthy": it re-searches the SAME depth with a wider window
+# and repeats until a result lands strictly inside its own window, which is
+# precisely `_negamax`'s own criterion for "this is the real, provable
+# minimax value" rather than a bound -- only then is the result fed back as
+# `prev_score` for the next depth's window and reported as that depth's
+# score. Doubling `ASPIRATION_INITIAL_DELTA` on every retry (both edges of
+# the window widen together, still centered on the same `prev_score`)
+# guarantees this terminates: `delta` cannot double forever without the
+# window's edges being clamped to `-INF`/`INF` (see `_aspiration_search`),
+# at which point the "re-search" is, by construction, an ordinary
+# full-width search. `tests/test_aspiration_windows.py` verifies this exact
+# isolated claim directly (LMR/null-move pruning both disabled for the
+# comparison), and it holds with zero exceptions found.
+#
+# IMPORTANT caveat once LMR is back in the picture (as it always is in the
+# shipped `Search`, never actually run in isolation): LMR's own reduction
+# decision depends on whether a reduced-depth probe's score fails high
+# against the CURRENT node's `beta` (see the LMR section above) -- and
+# `beta` at any node is a function of the window handed down from its
+# ancestors, ultimately from the root's own `(alpha, beta)`. Since aspiration
+# windows deliberately vary the ROOT's window across attempts (that's the
+# entire point), they can change which nodes' late moves happen to fail high
+# and get a full-depth re-search versus which ones don't -- i.e. LMR's own
+# search tree is not itself invariant to the window it's given. This means
+# the FULL system (aspiration + LMR + null-move pruning together, exactly as
+# shipped) is NOT guaranteed to be bit-identical to a full-width search of
+# the same depth, even though aspiration windows alone provably are:
+# confirmed empirically (`tests/test_aspiration_windows.py` documents a
+# concrete king+pawn-endgame example that diverges at depths 6-8 with LMR
+# enabled, yet matches exactly at every depth once LMR/null-move pruning are
+# disabled for the comparison). This is not a bug in aspiration windows, LMR,
+# or their combination -- it is an inherent property of composing an
+# exactness-preserving optimization with an already-heuristic one, the same
+# category of behavior real engines accept and validate via A/B playing-
+# strength testing rather than bit-for-bit reproducibility.
+#
+# Mate scores need no special-casing: a sudden mate score appearing at some
+# depth is just an ordinary fail-high (if positive, blowing past a narrow
+# `beta`) or fail-low (if negative, blowing past a narrow `alpha`), caught by
+# the exact same widen-and-retry loop as any other fail -- it costs one or
+# two extra widening rounds to grow the window out to where the mate score
+# actually lands, not a different code path.
+#
+# `ASPIRATION_MIN_DEPTH`: depths below this always use the full `(-INF,
+# INF)` window (`Search.search` never calls `_aspiration_search` for them).
+# Depth 1 has no previous completed depth's score to center a window on at
+# all, and depth 2's score is still typically too unstable (move ordering
+# itself is still stabilizing this early) to be worth narrowing around --
+# both depths are cheap enough that a full-width search costs nothing
+# meaningful anyway. Aspiration only starts paying for itself once there is
+# a depth-(n-1) score that is actually a decent predictor of depth n's.
+#
+# To be gated per architecture.md §15's rule for search extensions, the same
+# way null-move pruning/LMR above are: `tests/match_harness.py`'s
+# `play_match_searches`, same evaluator both sides, a fixed movetime, and a
+# ply_cap large enough for games to reach real conclusions rather than
+# drawing by cap. (The A/B match for this feature has not been run yet as of
+# this comment; do not treat any specific score here as real until an actual
+# match has been executed and this comment updated with its true result.)
+ASPIRATION_MIN_DEPTH = 3  # depths below this always use the full (-INF, INF) window
+ASPIRATION_INITIAL_DELTA = 25  # centipawns; ~1/4 of a pawn, standard narrow starting half-width
+
+
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
 
@@ -272,17 +356,87 @@ class Search:
         fallback_move = self._order_moves(root_moves, board, NULL_MOVE, 0)[0] if root_moves else NULL_MOVE
         best = SearchResult(fallback_move, 0, 0, 0, [])
 
+        # `prev_score` feeds `_aspiration_search`'s window center once depth
+        # reaches `ASPIRATION_MIN_DEPTH` (see the ASPIRATION_* constants
+        # block above); its initial value is never actually used as a window
+        # center (depths below that threshold always take the full-window
+        # branch instead), so 0 vs. anything else here makes no difference.
+        prev_score = 0
         for depth in range(1, limits.max_depth + 1):
-            score = self._negamax(board, depth, -INF, INF, 0, ctx)
+            if depth < ASPIRATION_MIN_DEPTH:
+                # Too shallow for a previous depth's score to be a
+                # meaningful window center yet -- searched exactly as every
+                # depth was before aspiration windows existed: full width.
+                score = self._negamax(board, depth, -INF, INF, 0, ctx)
+            else:
+                score = self._aspiration_search(board, depth, prev_score, ctx)
             if ctx.should_stop():
                 break  # partial/unreliable result from an aborted depth: discard entirely
             pv = self._extract_pv(board, depth)
             best = SearchResult(pv[0] if pv else best.best_move, score, depth, ctx.nodes, pv)
+            prev_score = score
             if on_info is not None:
                 on_info(SearchInfo(depth, score, ctx.nodes, pv))
             if abs(score) >= MATE_SCORE - 128:
                 break  # forced mate found; no point searching deeper
         return best
+
+    # --- Aspiration windows (architecture.md §9.3, Milestone 5 extension) ---
+
+    def _aspiration_search(self, board: Board, depth: int, prev_score: int, ctx: _SearchCtx) -> int:
+        """Depth `depth`'s real score, found by searching with a narrow
+        window centered on `prev_score` (the previous completed depth's
+        score) and re-searching this SAME depth with a wider window
+        whenever the result isn't trustworthy yet -- see the ASPIRATION_*
+        constants block above for the full correctness argument. Only ever
+        called for `depth >= ASPIRATION_MIN_DEPTH`; `Search.search` uses the
+        full `(-INF, INF)` window directly for every depth below that.
+
+        A result is trustworthy exactly when it lands strictly inside the
+        window it was searched with (`alpha < score < beta`): `_negamax`'s
+        own TT-flag logic classifies anything else -- `score <= alpha` ("fail
+        low") or `score >= beta` ("fail high") -- as a bound, not an exact
+        value, so this loop treats those identically and never returns one
+        as depth `depth`'s final score. Widening doubles `delta` and
+        recenters both edges on the same `prev_score` (clamped so the window
+        can never exceed the ordinary full `(-INF, INF)` bounds), which is
+        what guarantees the loop terminates: enough doublings clamp both
+        edges and the "re-search" degenerates into an ordinary full-width
+        search, which cannot itself fail (a legal position always has a
+        finite minimax value strictly between `-INF` and `INF`).
+
+        Mid-re-search stop signals: `ctx.should_stop()` is checked
+        immediately after every `_negamax` call, exactly where every other
+        call site in this file checks it, and this method returns
+        immediately (without widening further) the instant it's set. The
+        returned value is never inspected in that case -- `Search.search`
+        checks `ctx.should_stop()` again right after this method returns and
+        discards the whole depth if so, the same contract every other
+        aborted-iteration case in `.search()` already relies on -- so an
+        untrustworthy score from a stopped mid-widening call can never be
+        mistaken for depth `depth`'s real value, and the loop can never spin
+        forever waiting for a window a stopped search will never fill in.
+
+        Mate scores get no special case: a mate score simply fails high or
+        low like any other out-of-window score and is caught by the same
+        loop (see the ASPIRATION_* constants block above).
+        """
+        delta = ASPIRATION_INITIAL_DELTA
+        alpha = max(prev_score - delta, -INF)
+        beta = min(prev_score + delta, INF)
+        while True:
+            score = self._negamax(board, depth, alpha, beta, 0, ctx)
+            if ctx.should_stop():
+                return score  # discarded by the caller; see the docstring above
+            if alpha < score < beta:
+                return score  # lands strictly inside the window: a real, exact score
+            # Fail low (score <= alpha) or fail high (score >= beta): not
+            # trustworthy yet. Double delta and re-center the (still
+            # symmetric) window on the same prev_score, then re-search this
+            # SAME depth from scratch with the wider window.
+            delta *= 2
+            alpha = max(prev_score - delta, -INF)
+            beta = min(prev_score + delta, INF)
 
     # --- Negamax core (architecture.md §9.1) --------------------------------
 
@@ -306,7 +460,31 @@ class Search:
         alpha_orig = alpha
         entry = self.tt.probe(board.zobrist_hash)
         tt_move = entry.best_move if entry is not None else NULL_MOVE
-        if entry is not None and entry.depth >= depth:
+        # No TT-based early return/bound-narrowing at the root (`ply == 0`),
+        # only ever used above for move-ordering's `tt_move` hint. This is
+        # standard practice, and became load-bearing once aspiration windows
+        # (Milestone 5 extension) started passing a NARROW window into the
+        # root: `_aspiration_search` re-searches the SAME position at the
+        # SAME depth repeatedly (once per widening attempt) whenever a
+        # search fails low/high, and each attempt's own `store` leaves an
+        # UPPERBOUND/LOWERBOUND entry at that exact depth behind. Without
+        # this guard, the *next* (wider-window) attempt's TT probe finds
+        # that entry (`entry.depth >= depth` trivially holds -- same
+        # depth), narrows alpha/beta with it, and can short-circuit straight
+        # to `return score` before ever generating a single root move --
+        # returning last attempt's stale bound rather than a real result
+        # for the new window. That stale value can easily land strictly
+        # inside the new, wider window (`alpha < score < beta`), which is
+        # exactly the trustworthiness test `_aspiration_search` uses to
+        # accept a score as final -- so the aspiration loop would accept a
+        # bound left over from a too-narrow window as if it were this
+        # depth's genuine, fully-searched value. (Verified empirically: a
+        # king+pawn endgame at depth 6-7 diverged from a full-width
+        # reference before this guard was added, and matched after.) Every
+        # other node (`ply > 0`) keeps the TT cutoff exactly as before --
+        # only the root is special, precisely because it's the one node
+        # `_aspiration_search` deliberately re-queries at an unchanged depth.
+        if ply > 0 and entry is not None and entry.depth >= depth:
             score = score_from_tt(entry.score, ply)
             if entry.flag == TTFlag.EXACT:
                 return score
