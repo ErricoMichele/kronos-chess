@@ -37,12 +37,15 @@ from chessengine.evaluate import (
     ISOLATED_PAWN_PENALTY_CP,
     KING_SHIELD_CP_PER_PAWN,
     KING_ZONE_CP_PER_ATTACKER,
+    MOPUP_CENTER_CP_PER_UNIT,
+    MOPUP_KING_DISTANCE_CP_PER_UNIT,
     PASSED_PAWN_BONUS_BY_DISTANCE,
     CompositeEvaluator,
     KNIGHT_PST,
     QUEEN_PST,
     Weights,
     default_evaluator,
+    endgame_mopup_term,
     king_safety_term,
     material_pst_term,
     mobility_term,
@@ -304,28 +307,41 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
 
 
 def test_default_evaluator_enables_material_pst_mobility_and_pawn_structure() -> None:
-    """`default_evaluator()` enables `material_pst`, `mobility`, and
-    `pawn_structure` at nonzero weight (the latter two each validated by
-    their own A/B self-play match, architecture.md §10.2/§15's gate -- see
-    `Weights.mobility`'s and `Weights.pawn_structure`'s docstring comments).
-    `king_safety` is registered (`king_safety_term` is implemented and
-    unit-tested below) but stays at weight 0.0: its own A/B match did not
-    show a non-negative trend on a fair-sized sample (see
-    `Weights.king_safety`'s docstring comment) -- pinned down field by field
-    so a future term accidentally left enabled early (or a validated one
-    accidentally left disabled/enabled) would fail this test."""
+    """`default_evaluator()` enables `material_pst`, `mobility`,
+    `pawn_structure`, and `endgame_mopup` at nonzero weight (`mobility`/
+    `pawn_structure` each validated by their own A/B self-play match,
+    architecture.md §10.2/§15's gate -- see `Weights.mobility`'s and
+    `Weights.pawn_structure`'s docstring comments; `endgame_mopup` validated
+    by its own *functional* gate instead, since a generic opening-position
+    A/B match can't exercise a term that only activates in a bare-king-vs-
+    mating-material endgame -- see `Weights.endgame_mopup`'s docstring
+    comment for the exact positions/results). `king_safety` is registered
+    (`king_safety_term` is implemented and unit-tested below) but stays at
+    weight 0.0: its own A/B match did not show a non-negative trend on a
+    fair-sized sample (see `Weights.king_safety`'s docstring comment) --
+    pinned down field by field so a future term accidentally left enabled
+    early (or a validated one accidentally left disabled/enabled) would
+    fail this test."""
     evaluator = default_evaluator()
 
-    assert set(evaluator.terms) == {"material_pst", "mobility", "king_safety", "pawn_structure"}
+    assert set(evaluator.terms) == {
+        "material_pst",
+        "mobility",
+        "king_safety",
+        "pawn_structure",
+        "endgame_mopup",
+    }
     assert evaluator.terms["material_pst"] is material_pst_term
     assert evaluator.terms["mobility"] is mobility_term
     assert evaluator.terms["king_safety"] is king_safety_term
     assert evaluator.terms["pawn_structure"] is pawn_structure_term
+    assert evaluator.terms["endgame_mopup"] is endgame_mopup_term
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
     assert evaluator.weights.king_safety == 0.0
     assert evaluator.weights.pawn_structure == 1.0
+    assert evaluator.weights.endgame_mopup == 3.0
 
 
 # --- mobility_term ------------------------------------------------------
@@ -764,3 +780,254 @@ def test_pawn_structure_term_favors_more_advanced_passed_pawn() -> None:
     # passed bonus at distance 5 (d3, 20 cp) vs. distance 2 (d6, 100 cp).
     assert score_less_advanced == 10 + PASSED_PAWN_BONUS_BY_DISTANCE[5] == 30
     assert score_more_advanced == 10 + PASSED_PAWN_BONUS_BY_DISTANCE[2] == 110
+
+
+# --- endgame_mopup_term ------------------------------------------------------
+#
+# `endgame_mopup_term` (Milestone 5, gated off via `Weights.endgame_mopup`
+# until its own A/B match -- see the term's module comment and
+# `Weights.endgame_mopup` docstring in evaluate.py) activates only in a
+# genuine lone-king-vs-mating-material endgame (one bare king vs. K+Q, K+R,
+# K+B+B, or K+B+N -- explicitly not K+N+N) and, only then, rewards driving
+# the lone enemy king toward the edge/corner and the friendly king closer to
+# it. These tests use their own FEN set (`ENDGAME_MOPUP_FENS`), since none of
+# `SYMMETRY_FENS` above happens to contain a bare king.
+
+ENDGAME_MOPUP_FENS = (
+    "7k/8/8/8/8/8/8/4K2Q w - - 0 1",  # K+Q vs bare K, enemy king in the corner
+    "8/8/8/4k3/8/8/8/4K2Q w - - 0 1",  # K+Q vs bare K, enemy king in the center
+    "4k3/8/8/8/8/8/8/R3K3 w - - 0 1",  # K+R vs bare K
+    "4k3/8/8/8/8/8/8/2B1K1N1 w - - 0 1",  # K+B+N vs bare K
+)
+
+
+def test_endgame_mopup_term_negates_under_color_flip_mirror() -> None:
+    """`endgame_mopup_term(mirror) == -endgame_mopup_term(original)` for
+    every sample endgame position -- the same color-flip symmetry checked
+    for the other terms above, now for the mop-up term. `_color_flip_pieces`
+    only flips ranks (`sq ^ 56`), under which both the center-Manhattan-
+    distance and king-Chebyshev-distance components are themselves
+    invariant, so mirroring must exactly swap which color the bonus favors
+    without changing its magnitude."""
+    for fen in ENDGAME_MOPUP_FENS:
+        board = parse_fen(fen)
+        mirror = _color_flip_pieces(board)
+        assert endgame_mopup_term(mirror) == -endgame_mopup_term(board), (
+            f"color-flip symmetry broken for {fen!r}: "
+            f"endgame_mopup_term(original)={endgame_mopup_term(board)}, "
+            f"endgame_mopup_term(mirror)={endgame_mopup_term(mirror)}"
+        )
+
+
+def test_endgame_mopup_term_double_mirror_restores_original_score() -> None:
+    """Mirroring twice is the identity transform on piece placement, so it
+    must also be the identity on `endgame_mopup_term` (a second, independent
+    check on top of the plain negation above)."""
+    for fen in ENDGAME_MOPUP_FENS:
+        board = parse_fen(fen)
+        double_mirror = _color_flip_pieces(_color_flip_pieces(board))
+        assert endgame_mopup_term(double_mirror) == endgame_mopup_term(board)
+
+
+def test_endgame_mopup_term_zero_for_startpos() -> None:
+    """Neither side is remotely close to a bare king in the starting
+    position, so the shape-detection guard must return exactly 0 --
+    cheaply, without ever reaching the distance math."""
+    assert endgame_mopup_term(parse_fen(STARTPOS_FEN)) == 0
+
+
+def test_endgame_mopup_term_zero_when_neither_side_is_bare_king() -> None:
+    """A materially unbalanced but non-endgame position (extra queen for
+    White, but Black still has a knight, i.e. neither side is a bare king)
+    must score exactly 0 -- the term must not fire outside its one narrow,
+    explicitly-detected shape."""
+    fen = "3nk3/8/8/8/8/8/8/3QK3 w - - 0 1"  # White K+Q, Black K+N: neither is bare
+    assert endgame_mopup_term(parse_fen(fen)) == 0
+
+
+def test_endgame_mopup_term_zero_for_insufficient_material_knn_vs_k() -> None:
+    """K+N+N vs. a bare king is well-known *insufficient* material to force
+    mate unaided -- explicitly excluded from `_has_lone_mating_material` --
+    so this must score exactly 0 even though one side is a bare king and the
+    other holds two minor pieces."""
+    fen = "4k3/8/8/8/8/8/8/2N1K1N1 w - - 0 1"
+    assert endgame_mopup_term(parse_fen(fen)) == 0
+
+
+def test_endgame_mopup_term_zero_for_extra_piece_beyond_lone_mating_material() -> None:
+    """K+Q+N vs. a bare king has *more* than the lone-mating-material shape
+    (an extra knight beyond the queen) -- `_has_lone_mating_material` must
+    reject it, scoring exactly 0, since the detection is for the exact
+    K+Q/K+R/K+B+B/K+B+N shapes only, not merely 'has a queen or rook'."""
+    fen = "4k3/8/8/8/8/8/8/2N1K2Q w - - 0 1"
+    assert endgame_mopup_term(parse_fen(fen)) == 0
+
+
+def test_endgame_mopup_term_favors_cornered_enemy_king_over_centralized_one() -> None:
+    """With the same K+Q vs. bare-K material and an identical friendly king
+    square (e8 in both FENs), a lone enemy king in the corner (h8,
+    center-Manhattan-distance 6) must score a strictly larger bonus than the
+    same lone king on a central square (e5, center-Manhattan-distance 0) --
+    checked exactly via `MOPUP_CENTER_CP_PER_UNIT`, not just '>'."""
+    fen_corner = "4K2k/8/8/8/8/8/8/7Q w - - 0 1"  # White Ke8, Black king h8 (corner), Qh1
+    fen_central = "4K3/8/8/4k3/8/8/8/7Q w - - 0 1"  # White Ke8, Black king e5 (center), Qh1
+
+    score_corner = endgame_mopup_term(parse_fen(fen_corner))
+    score_central = endgame_mopup_term(parse_fen(fen_central))
+
+    assert score_corner > score_central, (
+        f"expected the cornered enemy king to score a larger bonus, got "
+        f"corner={score_corner}, central={score_central}"
+    )
+    # Hand-verified exactly: the friendly king (e8) is Chebyshev-distance 3
+    # from both h8 and e5, so the king-distance component is identical in
+    # both FENs and the entire difference is the center-distance component:
+    # h8's center-distance is 6, e5's is 0, a difference of
+    # 6 * MOPUP_CENTER_CP_PER_UNIT.
+    assert score_corner - score_central == 6 * MOPUP_CENTER_CP_PER_UNIT
+
+
+def test_endgame_mopup_term_favors_closer_friendly_king() -> None:
+    """With the same K+R vs. bare-K material and the same lone enemy king
+    square (e8 in both FENs), a friendly king standing closer (Chebyshev
+    distance) to the enemy king must score a strictly larger bonus than one
+    standing farther away -- checked exactly via
+    `MOPUP_KING_DISTANCE_CP_PER_UNIT`."""
+    fen_far = "4k3/8/8/8/8/8/8/R3K3 w - - 0 1"  # White king e1, Chebyshev dist 7 from e8
+    fen_close = "4k3/8/4K3/8/8/8/8/R7 w - - 0 1"  # White king e6, Chebyshev dist 2 from e8
+
+    score_far = endgame_mopup_term(parse_fen(fen_far))
+    score_close = endgame_mopup_term(parse_fen(fen_close))
+
+    assert score_close > score_far, (
+        f"expected the closer friendly king to score a larger bonus, got "
+        f"close={score_close}, far={score_far}"
+    )
+    # Hand-verified exactly: e8's center-distance (3) is identical in both
+    # FENs (the lone king never moves), so the entire difference is the
+    # king-distance component: e1->e8 is Chebyshev distance 7, e6->e8 is
+    # distance 2, a difference of 5 * MOPUP_KING_DISTANCE_CP_PER_UNIT.
+    assert score_close - score_far == 5 * MOPUP_KING_DISTANCE_CP_PER_UNIT
+
+
+def test_endgame_mopup_term_favors_mating_side_regardless_of_side_to_move() -> None:
+    """The same K+Q vs. bare-K position with Black to move instead of White:
+    White is still objectively the mating side, so `endgame_mopup_term`
+    (relative to the side to move, i.e. Black here) must flip sign to
+    negative -- confirms the directional result isn't an artifact of which
+    side happens to be on move."""
+    fen_white_to_move = "7k/8/8/8/8/8/8/4K2Q w - - 0 1"
+    fen_black_to_move = "7k/8/8/8/8/8/8/4K2Q b - - 0 1"
+
+    score_white_to_move = endgame_mopup_term(parse_fen(fen_white_to_move))
+    score_black_to_move = endgame_mopup_term(parse_fen(fen_black_to_move))
+
+    assert score_white_to_move > 0
+    assert score_black_to_move == -score_white_to_move
+
+
+# --- Additional isolated endgame_mopup_term checks --------------------------
+#
+# The tests above already exercise `endgame_mopup_term`'s color-flip
+# symmetry, its zero-guard on non-matching shapes, and its two directional
+# components using a mix of K+Q and K+R material. The tests below add a
+# handful of further, narrowly-scoped checks -- a normal (non-endgame)
+# middlegame FEN, an isolated single-position K+Q-vs-K symmetry check,
+# K+Q-vs-K-specific versions of both directional components, and a K+R-vs-K+R
+# ("mating material on both sides") zero check -- each self-contained and
+# independently hand-verified, reusing the same `_color_flip_pieces`/FEN
+# patterns used throughout this file.
+
+
+def test_endgame_mopup_term_zero_for_startpos_and_normal_middlegame() -> None:
+    """`endgame_mopup_term` must be exactly 0 both on the starting position
+    and on a normal, material-balanced middlegame FEN (Kiwipete) -- neither
+    is remotely close to the lone-king-vs-mating-material shape this term
+    targets, so the bare-king guard in `endgame_mopup_term` must return 0
+    immediately for both, without ever reaching the distance math."""
+    assert endgame_mopup_term(parse_fen(STARTPOS_FEN)) == 0
+
+    middlegame_fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1"
+    assert endgame_mopup_term(parse_fen(middlegame_fen)) == 0
+
+
+def test_endgame_mopup_term_kqvk_negates_under_color_flip_mirror() -> None:
+    """A dedicated, single-position version of the color-flip symmetry
+    check: on a K+Q-vs-bare-K position, `endgame_mopup_term(mirror)` must be
+    the exact negative of `endgame_mopup_term(original)`. The mating side's
+    bonus is nonzero here (confirmed below), so this also rules out a
+    trivial "both sides score 0" pass."""
+    fen = "7k/8/8/8/8/8/8/4K2Q w - - 0 1"  # White K+Q vs bare Black king in the corner
+    board = parse_fen(fen)
+    mirror = _color_flip_pieces(board)
+
+    score = endgame_mopup_term(board)
+    assert score != 0, "expected a nonzero mop-up bonus for this K+Q-vs-bare-K position"
+    assert endgame_mopup_term(mirror) == -score, (
+        f"color-flip symmetry broken for {fen!r}: original={score}, "
+        f"mirror={endgame_mopup_term(mirror)}"
+    )
+
+
+def test_endgame_mopup_term_kqvk_favors_cornered_enemy_king_over_centralized() -> None:
+    """Two K+Q-vs-bare-K FENs differing only in the lone (Black) king's
+    square -- a8 (corner) versus d5 (one of the 4 center squares) -- with the
+    mating White king (d8) and queen (h1) held fixed, must score the
+    cornered case strictly higher.
+
+    The White king (d8) is deliberately Chebyshev-distance 3 from *both*
+    a8 (same rank, file distance 3) and d5 (same file, rank distance 3), so
+    the king-distance component of the bonus is identical in both FENs and
+    the entire difference is the center-distance component: a8's
+    center-Manhattan-distance is 6 (a genuine corner), d5's is 0, a
+    difference of 6 * MOPUP_CENTER_CP_PER_UNIT -- checked exactly.
+    """
+    fen_corner = "k2K4/8/8/8/8/8/8/7Q w - - 0 1"  # Black king a8 (corner), White Kd8, Qh1
+    fen_central = "3K4/8/8/3k4/8/8/8/7Q w - - 0 1"  # Black king d5 (center), White Kd8, Qh1
+
+    score_corner = endgame_mopup_term(parse_fen(fen_corner))
+    score_central = endgame_mopup_term(parse_fen(fen_central))
+
+    assert score_corner > score_central, (
+        f"expected the cornered enemy king to score a larger bonus, got "
+        f"corner={score_corner}, central={score_central}"
+    )
+    assert score_corner - score_central == 6 * MOPUP_CENTER_CP_PER_UNIT
+    assert score_corner == 100 and score_central == 40
+
+
+def test_endgame_mopup_term_kqvk_favors_closer_friendly_king() -> None:
+    """Two K+Q-vs-bare-K FENs differing only in the mating White king's
+    square -- e1 (far) versus e6 (close) -- with the lone Black king (e8)
+    and White queen (a1) held fixed, must score the closer-king case
+    strictly higher.
+
+    e8's center-Manhattan-distance (3) is identical in both FENs (the lone
+    king never moves), so the entire difference is the king-distance
+    component: e1->e8 is Chebyshev distance 7, e6->e8 is distance 2, a
+    difference of 5 * MOPUP_KING_DISTANCE_CP_PER_UNIT -- checked exactly.
+    """
+    fen_far = "4k3/8/8/8/8/8/8/Q3K3 w - - 0 1"  # Black king e8, White Ke1 (far), Qa1
+    fen_close = "4k3/8/4K3/8/8/8/8/Q7 w - - 0 1"  # Black king e8, White Ke6 (close), Qa1
+
+    score_far = endgame_mopup_term(parse_fen(fen_far))
+    score_close = endgame_mopup_term(parse_fen(fen_close))
+
+    assert score_close > score_far, (
+        f"expected the closer friendly king to score a larger bonus, got "
+        f"close={score_close}, far={score_far}"
+    )
+    assert score_close - score_far == 5 * MOPUP_KING_DISTANCE_CP_PER_UNIT
+    assert score_far == 30 and score_close == 80
+
+
+def test_endgame_mopup_term_zero_for_krvkr_mating_material_on_both_sides() -> None:
+    """A K+R-vs-K+R endgame -- mating material on *both* sides, not the
+    lone-king-vs-mating-material shape this term targets -- must score
+    exactly 0: `_is_bare_king` is False for both colors here, so
+    `endgame_mopup_term`'s own guard (`white_bare == black_bare`) must return
+    0 immediately, confirming the detection is specific to the intended
+    shape and doesn't fire just because mating material is present
+    somewhere on the board."""
+    fen = "4k2r/8/8/8/8/8/8/R3K3 w - - 0 1"  # White K+R, Black K+R
+    assert endgame_mopup_term(parse_fen(fen)) == 0

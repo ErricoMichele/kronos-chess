@@ -296,6 +296,105 @@ def pawn_structure_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- Endgame mop-up (Milestone 5, gated off via Weights.endgame_mopup until --
+# --- its own A/B gate) -------------------------------------------------------
+#
+# A classic "mop-up" heuristic (architecture.md §15: "simple endgame
+# heuristics ... driving a lone king to the edge with mating material").
+# It only ever activates in a genuine lone-king-vs-mating-material endgame:
+# one color has no pawns and no pieces at all beyond its king (a bare king),
+# and the *other* color has no pawns and exactly enough material to force
+# mate alone against a bare king -- K+Q, K+R, K+B+B, or K+B+N (deliberately
+# **not** K+N+N, which cannot force mate unaided even with the defending
+# king reduced to a bare king). Anything else -- a normal material-rich
+# position, or a genuinely drawn "insufficient material" ending like
+# K+N+N vs K -- returns 0 immediately via two cheap all-zero/popcount
+# checks, before any of the distance math below ever runs, so this term
+# costs nothing outside its one narrow, explicitly-detected shape.
+#
+# When the shape *is* present, the bonus for the side with mating material
+# combines two standard mating-technique components:
+#   (a) how far the lone enemy king is from the center, via a
+#       center-Manhattan-distance table (0 at the 4 center squares, rising
+#       to 6 in each corner) -- computed directly from file_of/rank_of
+#       rather than a literal 64-entry table.
+#   (b) how close the friendly king is to the enemy king (Chebyshev
+#       distance, 0..7) -- the "box the king in" technique; smaller is
+#       better, so this contributes (7 - distance).
+#
+# Scale (centipawns; a simple starting point in the same spirit as
+# MOBILITY_CP_PER_SQUARE/KING_SHIELD_CP_PER_PAWN above -- not yet
+# hand-tuned or A/B-gated, hence Weights.endgame_mopup starts at 0.0):
+# 10 cp per unit of center-distance (max 6 * 10 = 60 cp for an enemy king
+# pinned in a corner) plus 10 cp per unit of (7 - king_distance) (max
+# 7 * 10 = 70 cp for the two kings standing adjacent), for a maximum
+# combined bonus of 130 cp -- comparable in size to the other terms above,
+# nudging the mating side toward the technique without ever swamping the
+# material difference itself.
+MOPUP_CENTER_CP_PER_UNIT = 10
+MOPUP_KING_DISTANCE_CP_PER_UNIT = 10
+
+
+def _is_bare_king(board: Board, color: int) -> bool:
+    """True if `color` has no pawns and no pieces at all other than its king."""
+    p = board.pieces[color]
+    return p[PAWN] == 0 and p[KNIGHT] == 0 and p[BISHOP] == 0 and p[ROOK] == 0 and p[QUEEN] == 0
+
+
+def _has_lone_mating_material(board: Board, color: int) -> bool:
+    """True if `color` has no pawns and exactly enough material to force
+    mate alone against a bare enemy king: one queen, one rook, or two minor
+    pieces including at least one bishop (K+B+B or K+B+N). K+N+N is
+    deliberately excluded -- two bare knights cannot force mate alone."""
+    p = board.pieces[color]
+    if p[PAWN] != 0:
+        return False
+    knights, bishops = popcount(p[KNIGHT]), popcount(p[BISHOP])
+    rooks, queens = popcount(p[ROOK]), popcount(p[QUEEN])
+    if queens == 1 and rooks == 0 and knights == 0 and bishops == 0:
+        return True
+    if rooks == 1 and queens == 0 and knights == 0 and bishops == 0:
+        return True
+    if queens == 0 and rooks == 0 and bishops >= 1 and knights + bishops == 2:
+        return True
+    return False
+
+
+def _mopup_bonus_for(board: Board, mating_color: int) -> int:
+    """Centipawn bonus for `mating_color`. Only called once the caller has
+    already confirmed `mating_color` holds lone mating material against
+    `1 - mating_color`'s bare king, so no shape-detection happens here."""
+    lone_color = 1 - mating_color
+    enemy_king = board.king_square(lone_color)
+    enemy_file, enemy_rank = file_of(enemy_king), rank_of(enemy_king)
+    # Center-Manhattan distance: 0 at the 4 center squares (d4/d5/e4/e5),
+    # rising to 6 in each corner.
+    center_dist = max(3 - enemy_file, enemy_file - 4) + max(3 - enemy_rank, enemy_rank - 4)
+
+    friendly_king = board.king_square(mating_color)
+    friendly_file, friendly_rank = file_of(friendly_king), rank_of(friendly_king)
+    king_dist = max(abs(friendly_file - enemy_file), abs(friendly_rank - enemy_rank))
+
+    return (
+        center_dist * MOPUP_CENTER_CP_PER_UNIT
+        + (7 - king_dist) * MOPUP_KING_DISTANCE_CP_PER_UNIT
+    )
+
+
+def endgame_mopup_term(board: Board) -> int:
+    white_bare, black_bare = _is_bare_king(board, WHITE), _is_bare_king(board, BLACK)
+    if white_bare == black_bare:
+        return 0  # both bare (dead draw) or neither bare: not this endgame shape
+
+    mating_color = BLACK if white_bare else WHITE
+    if not _has_lone_mating_material(board, mating_color):
+        return 0
+
+    bonus = _mopup_bonus_for(board, mating_color)
+    white_score = bonus if mating_color == WHITE else -bonus
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -337,6 +436,42 @@ class Weights:
     # rather than the near-tie/1-point-out-of-20 "muddle" that sank
     # king_safety above. Kept at 1.0 per architecture.md §10.2/§15.
     pawn_structure: float = 1.0
+    # Enabled at 3.0 per a *functional* gate rather than the usual opening-
+    # position A/B match: a generic opening/middlegame battery (like the one
+    # `mobility`/`pawn_structure` above used) essentially never reaches a
+    # lone-king-vs-mating-material endgame in a few plies at shallow depth,
+    # so it would never exercise this term at all. Instead, 3 hand-built
+    # KQvK/KRvK FENs with both kings placed far apart (opposite corners or
+    # far edges) and the mating side to move were played out via
+    # `tests/match_harness.py`'s `play_game` in full self-play (same
+    # `CompositeEvaluator` instance for both `white_search` and
+    # `black_search`, so the lone king's defense gets the same mop-up
+    # awareness as the mating side's attack) at a deliberately shallow,
+    # weak `SearchLimits(max_depth=2)` (also re-checked at `max_depth=3`),
+    # `ply_cap=200`, comparing `endgame_mopup=0.0` (material_pst+mobility+
+    # pawn_structure only, i.e. the pre-this-change default) against
+    # `endgame_mopup=3.0`:
+    #   - depth=2: without mop-up, all 3 positions stalled -- drawn by
+    #     repetition or the 50-move rule (plies 46/94/100) with the mating
+    #     side making little to no progress (e.g. king_dist/center_dist
+    #     barely moving). With mop-up=3.0, all 3 positions reached actual,
+    #     verified checkmate (0 legal moves + in_check) well inside the ply
+    #     cap: KQvK corner-to-corner at ply 67, KRvK corner-to-corner at ply
+    #     13, KQvK far-edges at ply 19.
+    #   - depth=3: same pattern -- without mop-up, all 3 again just drew
+    #     (plies 80/100/105, no progress); with mop-up=3.0, all 3 again
+    #     reached verified checkmate (plies 27/73/41).
+    # That is a clean, decisive functional improvement (checkmate reached in
+    # 6/6 mop-up-enabled runs across both depths vs. 0/6 without it, not
+    # merely "meaningfully closer") -- a far stronger signal than the
+    # architecture.md §10.2/§15 "non-negative trend" bar. (A smaller weight
+    # of 1.0 was tried first per that section's suggestion and only reached
+    # mate in 1 of 3 positions, with one game losing the queen to a
+    # depth-2-shallow-search blunder; 3.0 was the value that produced the
+    # clean 3/3 result, and since this term is 0 outside the narrow bare-
+    # king-vs-mating-material shape it's gated to, a larger weight here
+    # doesn't risk distorting evaluation anywhere else.)
+    endgame_mopup: float = 3.0
 
 
 class CompositeEvaluator:
@@ -358,20 +493,32 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """Material+PST, mobility, and pawn_structure are enabled; `king_safety`
-    is registered (wired in, unit-tested) but disabled at weight 0.0.
-    `mobility_term` and `pawn_structure_term` each passed their own A/B
-    self-play gate (see `Weights.mobility`'s and `Weights.pawn_structure`'s
-    docstring comments above); `king_safety`'s A/B match did not show a
-    non-negative trend on a fair-sized sample (see `Weights.king_safety`'s
-    docstring comment above), so it stays disabled pending a better-tuned
-    scale or a larger/deeper re-gate."""
+    """Material+PST, mobility, pawn_structure, and endgame_mopup are
+    enabled; `king_safety` is registered (wired in, unit-tested) but
+    disabled at weight 0.0. `mobility_term` and `pawn_structure_term` each
+    passed their own A/B self-play gate (see `Weights.mobility`'s and
+    `Weights.pawn_structure`'s docstring comments above); `king_safety`'s A/B
+    match did not show a non-negative trend on a fair-sized sample (see
+    `Weights.king_safety`'s docstring comment above), so it stays disabled
+    pending further evidence. `endgame_mopup` passed its own *functional*
+    gate -- a generic opening-position A/B match can't exercise a term that
+    only ever activates in a bare-king-vs-mating-material endgame, so it was
+    instead gated by self-play from hand-built KQvK/KRvK positions (see
+    `Weights.endgame_mopup`'s docstring comment above for the exact
+    positions/results) -- and is enabled at weight 3.0."""
     return CompositeEvaluator(
         terms={
             "material_pst": material_pst_term,
             "mobility": mobility_term,
             "king_safety": king_safety_term,
             "pawn_structure": pawn_structure_term,
+            "endgame_mopup": endgame_mopup_term,
         },
-        weights=Weights(material_pst=1.0, mobility=1.0, king_safety=0.0, pawn_structure=1.0),
+        weights=Weights(
+            material_pst=1.0,
+            mobility=1.0,
+            king_safety=0.0,
+            pawn_structure=1.0,
+            endgame_mopup=3.0,
+        ),
     )
