@@ -1,0 +1,16 @@
+{
+  "iterations": 50,
+  "games_per_match": 12,
+  "search_depth": 3,
+  "initial_a": 1.0,
+  "initial_c": 5.0,
+  "a_decay": 0.602,
+  "c_decay": 0.101,
+  "parameters": {
+    "material_pst": {"initial": 1.0, "min": 0.5, "max": 2.0},
+    "mobility": {"initial": 1.0, "min": 0.0, "max": 3.0},
+    "king_safety": {"initial": 1.0, "min": 0.0, "max": 3.0},
+    "pawn_structure": {"initial": 1.0, "min": 0.0, "max": 3.0},
+    "endgame_mopup": {"initial": 3.0, "min": 0.0, "max": 10.0}
+  }
+}
