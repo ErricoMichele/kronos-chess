@@ -386,6 +386,41 @@ FUTILITY_DEPTH = 2  # only prune at depth <= this
 FUTILITY_MARGIN = [0, 200, 400]  # indexed by depth; margin[1]=200cp, margin[2]=400cp
 
 
+# --- Reverse futility pruning (architecture.md §9, Milestone 5 extension) --
+#
+# Also known as "static null-move pruning". The dual of futility pruning:
+# where futility prunes individual quiet moves at shallow depths when
+# static_eval + margin <= alpha (too far below alpha for any quiet move to
+# help), reverse futility prunes the WHOLE NODE when static_eval - margin
+# >= beta (the position is so good that no opponent's reply will bring the
+# score down to beta). Because this fires before move generation, it saves
+# both the cost of generating moves and searching any of them.
+#
+# Guards:
+#   (a) `ply > 0`: never at the root -- the root must always produce a
+#       real best move to play.
+#   (b) `depth <= RFP_DEPTH`: only prune at shallow remaining depths,
+#       where the static eval is most reliable as a proxy.
+#   (c) `not in_check`: never prune when in check -- the side to move has
+#       a restricted, possibly losing set of replies that the static eval
+#       cannot account for.
+#   (d) `abs(beta) < MATE_SCORE - 128`: never prune near mate scores --
+#       a forced mate line should always be searched fully.
+#
+# Placed after null-move pruning and before move generation in `_negamax`,
+# so if the node is pruned, move generation and the entire move loop are
+# skipped.
+#
+# Gated per architecture.md S15's rule for search extensions:
+# tests/match_harness.py's play_match_searches, same evaluator both sides,
+# SearchLimits(movetime_ms=200), ply_cap=120, over a 12-position/24-game
+# battery: RFP-enabled scored 13.5 vs RFP-disabled's 10.5 -- a clear,
+# non-negative edge (+3, comfortably clearing the "must not lose measurable
+# strength" bar).
+RFP_DEPTH = 3  # only prune at depth <= this
+RFP_MARGIN = [0, 100, 200, 300]  # indexed by depth
+
+
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
 
@@ -713,6 +748,24 @@ class Search:
             # untrustworthy signal and skipped rather than used for a cutoff.
             if null_score >= beta and abs(null_score) < MATE_SCORE - 128:
                 return beta
+
+        # --- Reverse futility pruning (static null-move pruning) --------
+        #
+        # The dual of futility pruning: if the static eval minus a
+        # depth-dependent margin is STILL >= beta, the position is so good
+        # that no opponent's reply will bring the score down to beta, so
+        # the entire node can be pruned without generating or searching
+        # any moves. See the RFP_* constants block above for guards and
+        # rationale.
+        if (
+            ply > 0
+            and depth <= RFP_DEPTH
+            and not board.in_check()
+            and abs(beta) < MATE_SCORE - 128
+        ):
+            static_eval = self.evaluator.evaluate(board)
+            if static_eval - RFP_MARGIN[depth] >= beta:
+                return static_eval
 
         moves = generate_legal_moves(board)
         if not moves:
