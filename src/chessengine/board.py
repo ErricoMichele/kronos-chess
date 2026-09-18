@@ -105,6 +105,7 @@ class UndoInfo:
     halfmove_clock: int  # 50-move counter *before* this move
     zobrist_hash: int  # full hash *before* this move
     material_pst_score: int  # White-relative material+PST total *before* this move
+    pawn_hash: int  # pawn-only Zobrist hash *before* this move
 
 
 class Board:
@@ -123,6 +124,7 @@ class Board:
         "position_history",
         "material_pst_score",
         "null_move_history",
+        "pawn_hash",
     )
 
     def __init__(self) -> None:
@@ -139,6 +141,7 @@ class Board:
         self.history: list[UndoInfo] = []
         self.position_history: list[int] = []  # hashes seen, for repetition
         self.material_pst_score: int = 0  # White's PIECE_VALUE+PST total minus Black's (§10.1)
+        self.pawn_hash: int = 0  # pawn-only Zobrist hash (for pawn structure caching)
         # Dedicated undo stack for make_null_move/unmake_null_move (§6), kept
         # fully separate from `history`/`UndoInfo` so null-move bookkeeping
         # can never disturb the already-perft-verified real move machinery.
@@ -198,6 +201,7 @@ class Board:
                 self.halfmove_clock,
                 self.zobrist_hash,
                 self.material_pst_score,
+                self.pawn_hash,
             )
         )
 
@@ -257,6 +261,7 @@ class Board:
         self.halfmove_clock = undo.halfmove_clock
         self.zobrist_hash = undo.zobrist_hash
         self.material_pst_score = undo.material_pst_score
+        self.pawn_hash = undo.pawn_hash
         if us == BLACK:
             self.fullmove_number -= 1
 
@@ -322,6 +327,8 @@ class Board:
         self.occupied |= bit
         self.mailbox[sq] = piece_code
         self.zobrist_hash ^= ZOBRIST_PIECE[color][ptype][sq]
+        if ptype == PAWN:
+            self.pawn_hash ^= ZOBRIST_PIECE[color][ptype][sq]
         contribution = PIECE_VALUE[ptype] + (PST[ptype][sq ^ 56] if color == BLACK else PST[ptype][sq])
         self.material_pst_score += contribution if color == WHITE else -contribution
 
@@ -332,6 +339,8 @@ class Board:
         self.occupied &= ~bit
         self.mailbox[sq] = NO_PIECE
         self.zobrist_hash ^= ZOBRIST_PIECE[color][ptype][sq]
+        if ptype == PAWN:
+            self.pawn_hash ^= ZOBRIST_PIECE[color][ptype][sq]
         contribution = PIECE_VALUE[ptype] + (PST[ptype][sq ^ 56] if color == BLACK else PST[ptype][sq])
         self.material_pst_score -= contribution if color == WHITE else -contribution
 

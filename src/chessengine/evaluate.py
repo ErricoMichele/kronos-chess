@@ -292,8 +292,51 @@ def _side_pawn_structure(board: Board, color: int) -> int:
     return score
 
 
-def pawn_structure_term(board: Board) -> int:
+class PawnHashTable:
+    """Fixed-size cache for pawn_structure_term results, keyed by the board's
+    pawn-only Zobrist hash. A standard chess engine optimization: pawn
+    structure depends only on pawn positions, so the same pawn configuration
+    returns the same score regardless of piece placement, and evaluating it
+    is expensive enough (file/rank iteration over every pawn) to justify a
+    dedicated cache."""
+
+    __slots__ = ("_size", "_keys", "_scores")
+
+    def __init__(self, size: int = 16384) -> None:
+        self._size = size
+        self._keys: list[int] = [0] * size
+        self._scores: list[int] = [0] * size
+
+    def probe(self, pawn_hash: int) -> int | None:
+        """Return the cached score for `pawn_hash`, or None on a miss."""
+        idx = pawn_hash % self._size
+        if self._keys[idx] == pawn_hash:
+            return self._scores[idx]
+        return None
+
+    def store(self, pawn_hash: int, score: int) -> None:
+        """Store `score` under `pawn_hash`, always replacing."""
+        idx = pawn_hash % self._size
+        self._keys[idx] = pawn_hash
+        self._scores[idx] = score
+
+    def clear(self) -> None:
+        """Reset every entry (called on new_game)."""
+        for i in range(self._size):
+            self._keys[i] = 0
+            self._scores[i] = 0
+
+
+def pawn_structure_term(board: Board, pawn_cache: PawnHashTable | None = None) -> int:
+    if pawn_cache is not None:
+        cached = pawn_cache.probe(board.pawn_hash)
+        if cached is not None:
+            # Cache stores the White-relative score; convert to side-to-move-
+            # relative on return, since pawn_hash does not encode side_to_move.
+            return cached if board.side_to_move == WHITE else -cached
     white_score = _side_pawn_structure(board, WHITE) - _side_pawn_structure(board, BLACK)
+    if pawn_cache is not None:
+        pawn_cache.store(board.pawn_hash, white_score)
     return white_score if board.side_to_move == WHITE else -white_score
 
 
@@ -479,13 +522,17 @@ class CompositeEvaluator:
     def __init__(self, terms: dict[str, TermFn], weights: Weights | None = None) -> None:
         self.terms = terms
         self.weights = weights or Weights()
+        self.pawn_cache = PawnHashTable()
 
     def evaluate(self, board: Board) -> int:
         total = 0
         for name, term_fn in self.terms.items():
             w = getattr(self.weights, name, 0.0)
             if w:
-                total += int(w * term_fn(board))
+                if name == "pawn_structure":
+                    total += int(w * term_fn(board, self.pawn_cache))
+                else:
+                    total += int(w * term_fn(board))
         return total
 
 

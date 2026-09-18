@@ -469,11 +469,13 @@ class Search:
         self.history: list[list[int]] = [[0] * 64 for _ in range(64)]  # [from][to]
 
     def new_game(self) -> None:
-        """Called on UCI 'ucinewgame'. Stale TT/killer/history entries from
-        a previous, unrelated game must not leak into this one."""
+        """Called on UCI 'ucinewgame'. Stale TT/killer/history/pawn-cache
+        entries from a previous, unrelated game must not leak into this one."""
         self.tt.clear()
         self.killers = [[NULL_MOVE, NULL_MOVE] for _ in range(MAX_PLY)]
         self.history = [[0] * 64 for _ in range(64)]
+        if hasattr(self.evaluator, "pawn_cache"):
+            self.evaluator.pawn_cache.clear()
 
     # --- Top-level entry point (architecture.md §9.3) ----------------------
 

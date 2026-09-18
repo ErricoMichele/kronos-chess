@@ -42,6 +42,7 @@ from chessengine.evaluate import (
     PASSED_PAWN_BONUS_BY_DISTANCE,
     CompositeEvaluator,
     KNIGHT_PST,
+    PawnHashTable,
     QUEEN_PST,
     Weights,
     default_evaluator,
@@ -1024,3 +1025,73 @@ def test_endgame_mopup_term_zero_for_krvkr_mating_material_on_both_sides() -> No
     somewhere on the board."""
     fen = "4k2r/8/8/8/8/8/8/R3K3 w - - 0 1"  # White K+R, Black K+R
     assert endgame_mopup_term(parse_fen(fen)) == 0
+
+
+# --- PawnHashTable tests -------------------------------------------------------
+#
+# The pawn hash table caches `pawn_structure_term` results keyed by
+# `board.pawn_hash`, a pawn-only Zobrist hash maintained incrementally in
+# `make_move`/`unmake_move`. These tests verify:
+#   1. Cached results match uncached results for several positions.
+#   2. The cache actually hits on the same pawn structure (second call returns
+#      cached value).
+#   3. Different pawn structures produce different cache entries.
+
+
+def test_pawn_structure_term_cached_matches_uncached() -> None:
+    """Calling `pawn_structure_term` with a `PawnHashTable` must return the
+    exact same score as calling it without one, for several sample positions
+    -- the cache must never change the result, only skip re-computation."""
+    cache = PawnHashTable()
+    for fen in SYMMETRY_FENS:
+        board = parse_fen(fen)
+        uncached_score = pawn_structure_term(board)
+        cached_score = pawn_structure_term(board, pawn_cache=cache)
+        assert cached_score == uncached_score, (
+            f"cached != uncached for {fen!r}: cached={cached_score}, "
+            f"uncached={uncached_score}"
+        )
+
+
+def test_pawn_hash_table_hits_on_same_position() -> None:
+    """Calling `pawn_structure_term` twice on the same board with the same
+    cache must return the same score, and the second call must be a cache
+    hit (verified by probing the cache directly after the first call)."""
+    cache = PawnHashTable()
+    board = parse_fen(STARTPOS_FEN)
+
+    first_score = pawn_structure_term(board, pawn_cache=cache)
+
+    # The cache must now contain this pawn_hash.
+    cached_value = cache.probe(board.pawn_hash)
+    assert cached_value is not None, "expected a cache hit after the first call"
+    assert cached_value == first_score
+
+    # Second call must return the same score (from the cache).
+    second_score = pawn_structure_term(board, pawn_cache=cache)
+    assert second_score == first_score
+
+
+def test_pawn_hash_table_different_structures_differ() -> None:
+    """Two positions with different pawn structures must produce different
+    `pawn_hash` values and (in general) different `pawn_structure_term`
+    scores, confirming the cache correctly distinguishes them."""
+    fen_clean = "4k3/3ppp2/8/8/8/8/3PPP2/4K3 w - - 0 1"  # clean, no doubled
+    fen_doubled = "4k3/3ppp2/8/8/8/3P4/3PPP2/4K3 w - - 0 1"  # doubled d-file
+
+    board_clean = parse_fen(fen_clean)
+    board_doubled = parse_fen(fen_doubled)
+
+    # Different pawn placements must produce different pawn hashes.
+    assert board_clean.pawn_hash != board_doubled.pawn_hash, (
+        "expected different pawn_hash values for different pawn structures"
+    )
+
+    cache = PawnHashTable()
+    score_clean = pawn_structure_term(board_clean, pawn_cache=cache)
+    score_doubled = pawn_structure_term(board_doubled, pawn_cache=cache)
+
+    assert score_clean != score_doubled, (
+        f"expected different scores for different pawn structures, got "
+        f"clean={score_clean}, doubled={score_doubled}"
+    )
