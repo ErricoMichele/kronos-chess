@@ -393,22 +393,21 @@ def test_lmr_re_search_keeps_extreme_reduction_identical_to_unpatched_reference(
     test) make LMR's own reduction decisions window-dependent (see
     tests/test_aspiration_windows.py), which would otherwise make
     `reference` itself vary with the root window and confound what this
-    specific test checks. Check extensions (added later still) are also
-    disabled for both sides here, for the analogous reason: a reduced-depth
-    probe and its full-depth re-search can accumulate different amounts of
+    specific test checks. Check extensions and PVS are also disabled for
+    both sides here, for the analogous reason: a reduced-depth probe and
+    its full-depth re-search can accumulate different amounts of
     check-extension bonus once the probe depth differs this drastically,
-    which would confound this test the same way (see the module comment
-    above `_SAFETY_NET_STRESS_CASES` for the concrete numbers). This is NOT
+    and PVS's zero-width scout changes the window passed to LMR re-searches
+    at PV nodes, both of which would confound this test. This is NOT
     claiming the extreme-patch-vs-reference equivalence holds
-    unconditionally for every depth, with aspiration windows active, or
-    with check extensions active -- it demonstrably does not (see
-    test_aspiration_windows.py's documented king+pawn-endgame counter-
-    example for the first, and the module comment above for the second) --
-    only that, independent of both, LMR's re-search safety net keeps this
+    unconditionally for every depth, with aspiration windows active,
+    with check extensions active, or with PVS active -- only that,
+    independent of all three, LMR's re-search safety net keeps this
     specific tested battery's answers intact even under a deliberately
     extreme reduction.
     """
     monkeypatch.setattr(search_mod, "CHECK_EXTENSION_MAX_PLIES", 0)
+    monkeypatch.setattr(search_mod, "PVS_ENABLED", False)
 
     board_ref = parse_fen(fen)
     reference = _FullWidthSearch(default_evaluator()).search(board_ref, SearchLimits(max_depth=depth))

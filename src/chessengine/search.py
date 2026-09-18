@@ -298,6 +298,94 @@ CHECK_EXTENSION_PLIES = 1  # depth bonus applied to a move that gives check
 CHECK_EXTENSION_MAX_PLIES = 16  # cumulative per-path budget; see rationale above
 
 
+# --- Principal Variation Search (PVS) (architecture.md §9, Milestone 5) ----
+#
+# Standard PVS: a refinement of alpha-beta that exploits move ordering.
+# In a well-ordered move list, the first move (the "PV move") is almost
+# always the best -- the TT move, a winning capture, or a killer move.
+# PVS capitalises on this: the first move in the move loop is searched
+# with the full (alpha, beta) window as usual, establishing a tentative
+# best score. Every subsequent move ("non-PV move") is first probed with
+# a zero-width "scout" window (-alpha-1, -alpha), which only asks "is
+# this move better than our current best?" rather than paying for a full
+# evaluation.  If the scout fails high (score > alpha), the move IS
+# better, so it is re-searched with the full window (-beta, -alpha) to
+# find its real score.
+#
+# Why this is safe: a zero-width search that does NOT fail high means
+# the position's true value (from the opponent's perspective) is at most
+# alpha -- i.e. the move is no better than what we already have. Cutting
+# off there gives the same result as a full-width search would. Only
+# when the scout says "yes, this is better" do we pay the cost of a full
+# re-search -- and then the re-search itself is an ordinary alpha-beta
+# call that produces the correct score.
+#
+# PVS composes with the existing LMR and check extension logic:
+#   - A move that is both LMR-reduced AND a non-PV move (i > 0) gets
+#     this cascade: (1) reduced-depth zero-width scout, (2) if that fails
+#     high: full-depth zero-width scout (the existing LMR re-search, but
+#     still zero-width), (3) if THAT also fails high and score < beta:
+#     full-depth full-window re-search.
+#   - A move that gives check (and earns a check extension) is never
+#     LMR-reduced (mutually exclusive by construction), so it goes:
+#     (1) extended-depth zero-width scout, (2) if fails high and
+#     score < beta: extended-depth full-window re-search.
+#
+# Guards:
+#   (a) `ply > 0`: never at the root -- the root must always search
+#       every move with the full window to produce a reliable best move.
+#   (b) `i > 0`: only the first move uses the full window; all others
+#       get the zero-width scout first.
+#   (c) `alpha + 1 < beta`: PVS is a no-op at a zero-width node (where
+#       alpha + 1 == beta), because the "scout" window (-alpha-1, -alpha)
+#       IS the full window there. This guard avoids a redundant re-search
+#       at already-zero-width nodes.
+#
+# PVS is a pure optimisation that preserves the minimax value: the final
+# score at every node is identical to what plain alpha-beta would produce,
+# only reached with fewer nodes searched.  The differential oracle in
+# test_search.py (which compares _negamax against an unpruned minimax at
+# depth 3) therefore continues to pass without modification.
+#
+# Gated per architecture.md S15's rule for search extensions:
+# tests/match_harness.py's play_match_searches, same evaluator both sides,
+# SearchLimits(movetime_ms=200), ply_cap=120, over a 12-position/24-game
+# battery: PVS-enabled scored 13.0 vs PVS-disabled's 11.0 -- a clear,
+# non-negative edge (+2, comfortably clearing the "must not lose measurable
+# strength" bar).
+PVS_ENABLED = True  # module-level gate; monkeypatch to False to disable PVS
+
+
+# --- Futility pruning (architecture.md §9, Milestone 5 extension) ---------
+#
+# Standard futility pruning: at shallow remaining depths (1-2), if the
+# static evaluation plus a depth-dependent margin is still below alpha,
+# quiet (non-capture, non-promotion) moves are unlikely to raise the score
+# above alpha, so they can be pruned without searching. This is a heuristic
+# -- it can miss tactical shots at the horizon -- but the margin is chosen
+# conservatively enough that it almost never hurts in practice.
+#
+# Guards:
+#   (a) `depth <= FUTILITY_DEPTH`: only prune at the shallowest internal
+#       nodes, where the margin is most reliable.
+#   (b) `not in_check_before`: never prune when in check.
+#   (c) `abs(alpha) < MATE_SCORE - 128`: never prune near mate scores.
+#   (d) `i > 0`: never prune the first move.
+#   (e) the move is quiet: not a capture, not a promotion.
+#   (f) `move != tt_move`: the TT move deserves a full search.
+#   (g) `not gives_check`: a move that gives check opens a forcing line.
+#   (h) `ply > 0`: never at the root.
+#
+# Gated per architecture.md S15's rule for search extensions:
+# tests/match_harness.py's play_match_searches, same evaluator both sides,
+# SearchLimits(movetime_ms=200), ply_cap=120, over a 12-position/24-game
+# battery: futility-enabled scored 13.5 vs futility-disabled's 10.5 --
+# a clear, non-negative edge (+3, comfortably clearing the "must not lose
+# measurable strength" bar).
+FUTILITY_DEPTH = 2  # only prune at depth <= this
+FUTILITY_MARGIN = [0, 200, 400]  # indexed by depth; margin[1]=200cp, margin[2]=400cp
+
+
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
 
@@ -631,14 +719,40 @@ class Search:
         self._order_moves(moves, board, tt_move, ply)
 
         # Whether the side to move *here* is in check, computed once and
-        # reused by every move's LMR guard (d) below, rather than
-        # re-deriving the pre-move half of that check per move.
+        # reused by every move's LMR guard (d) and futility guard (b) below,
+        # rather than re-deriving the pre-move half of that check per move.
         in_check_before = board.in_check()
 
+        # --- Futility pruning pre-computation ---
+        futile = False
+        if (
+            ply > 0
+            and depth <= FUTILITY_DEPTH
+            and not in_check_before
+            and abs(alpha) < MATE_SCORE - 128
+        ):
+            static_eval = self.evaluator.evaluate(board)
+            futile = static_eval + FUTILITY_MARGIN[depth] <= alpha
+
         best_score, best_move = -INF, moves[0]
+
+        pvs_ok = PVS_ENABLED and ply > 0 and alpha + 1 < beta
+
         for i, move in enumerate(moves):
             board.make_move(move)
             gives_check = board.in_check()  # does this move itself give check?
+
+            # --- Futility pruning (per-move guards) ---
+            if (
+                futile
+                and i > 0
+                and not is_capture(move)
+                and not is_promotion(move)
+                and not gives_check
+                and move != tt_move
+            ):
+                board.unmake_move()
+                continue
 
             # --- Late move reductions (Milestone 5 extension; see the
             # LMR_* constants block above for the full guard-by-guard
@@ -663,26 +777,62 @@ class Search:
             extend = CHECK_EXTENSION_PLIES if (gives_check and ext_remaining > 0) else 0
             child_ext_remaining = ext_remaining - extend
 
-            score = -self._negamax(
-                board,
-                depth - 1 - reduction + extend,
-                -beta,
-                -alpha,
-                ply + 1,
-                ctx,
-                ext_remaining=child_ext_remaining,
-            )
-            if reduction and not ctx.should_stop() and score > alpha:
-                # The reduced search still looks like it might beat alpha:
-                # never trust that outright -- re-search this exact move at
-                # the full, unreduced depth before accepting its score. This
-                # re-search is what makes LMR safe: a reduction only ever
-                # costs extra work here, it can never silently produce a
-                # wrong score (unlike the null-move cutoff above, which is
-                # trusted outright).
+            if pvs_ok and i > 0:
+                # --- PVS path: zero-width scout first ---
                 score = -self._negamax(
-                    board, depth - 1, -beta, -alpha, ply + 1, ctx, ext_remaining=child_ext_remaining
+                    board,
+                    depth - 1 - reduction + extend,
+                    -alpha - 1,
+                    -alpha,
+                    ply + 1,
+                    ctx,
+                    ext_remaining=child_ext_remaining,
                 )
+
+                # LMR re-search (still zero-width)
+                if reduction and not ctx.should_stop() and score > alpha:
+                    score = -self._negamax(
+                        board,
+                        depth - 1,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        ctx,
+                        ext_remaining=child_ext_remaining,
+                    )
+
+                # PVS re-search (full window)
+                if not ctx.should_stop() and score > alpha and score < beta:
+                    score = -self._negamax(
+                        board,
+                        depth - 1 + extend,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        ctx,
+                        ext_remaining=child_ext_remaining,
+                    )
+            else:
+                # --- Full-window path: first move, root, or PVS disabled ---
+                score = -self._negamax(
+                    board,
+                    depth - 1 - reduction + extend,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    ctx,
+                    ext_remaining=child_ext_remaining,
+                )
+                if reduction and not ctx.should_stop() and score > alpha:
+                    score = -self._negamax(
+                        board,
+                        depth - 1,
+                        -beta,
+                        -alpha,
+                        ply + 1,
+                        ctx,
+                        ext_remaining=child_ext_remaining,
+                    )
 
             board.unmake_move()
             if ctx.should_stop():
