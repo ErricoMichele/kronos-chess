@@ -546,6 +546,60 @@ def king_activity_term(board: Board) -> int:
     return score if board.side_to_move == WHITE else -score
 
 
+# --- Knight outpost (Milestone 5 extension) ----------------------------------
+#
+# A knight on an "outpost" — an advanced square (ranks 4-6 for White,
+# ranks 3-5 for Black) that is protected by at least one friendly pawn
+# and cannot be attacked by any enemy pawn — is a powerful positional
+# asset. The knight is firmly anchored, controls key squares, and can
+# only be challenged by pieces, not pawns.
+KNIGHT_OUTPOST_BONUS_CP = 20
+
+
+def _side_knight_outpost(board: Board, color: int) -> int:
+    knights = board.pieces[color][KNIGHT]
+    own_pawns = board.pieces[color][PAWN]
+    enemy_pawns = board.pieces[1 - color][PAWN]
+    ahead_rank_mask = _AHEAD_RANK_MASK[color]
+    score = 0
+    for sq in iter_bits(knights):
+        f, r = file_of(sq), rank_of(sq)
+        if color == WHITE and not (3 <= r <= 5):
+            continue
+        if color == BLACK and not (2 <= r <= 4):
+            continue
+
+        protected = False
+        if color == WHITE and r > 0:
+            if f > 0 and (own_pawns & (1 << ((r - 1) * 8 + f - 1))):
+                protected = True
+            if f < 7 and (own_pawns & (1 << ((r - 1) * 8 + f + 1))):
+                protected = True
+        elif color == BLACK and r < 7:
+            if f > 0 and (own_pawns & (1 << ((r + 1) * 8 + f - 1))):
+                protected = True
+            if f < 7 and (own_pawns & (1 << ((r + 1) * 8 + f + 1))):
+                protected = True
+        if not protected:
+            continue
+
+        adjacent_files = 0
+        if f > 0:
+            adjacent_files |= FILE_MASK[f - 1]
+        if f < 7:
+            adjacent_files |= FILE_MASK[f + 1]
+        if enemy_pawns & adjacent_files & ahead_rank_mask[r]:
+            continue
+
+        score += KNIGHT_OUTPOST_BONUS_CP
+    return score
+
+
+def knight_outpost_term(board: Board) -> int:
+    white_score = _side_knight_outpost(board, WHITE) - _side_knight_outpost(board, BLACK)
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -623,6 +677,7 @@ class Weights:
     bishop_pair: float = 1.0
     rook_open_file: float = 1.0
     king_activity: float = 1.0
+    knight_outpost: float = 1.0
 
 
 class CompositeEvaluator:
@@ -648,7 +703,7 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """All eight evaluation terms enabled."""
+    """All ten evaluation terms enabled."""
     return CompositeEvaluator(
         terms={
             "material_pst": material_pst_term,
@@ -660,6 +715,7 @@ def default_evaluator() -> CompositeEvaluator:
             "bishop_pair": bishop_pair_term,
             "rook_open_file": rook_open_file_term,
             "king_activity": king_activity_term,
+            "knight_outpost": knight_outpost_term,
         },
         weights=Weights(
             material_pst=1.0,
@@ -671,5 +727,6 @@ def default_evaluator() -> CompositeEvaluator:
             bishop_pair=1.0,
             rook_open_file=1.0,
             king_activity=1.0,
+            knight_outpost=1.0,
         ),
     )

@@ -455,6 +455,36 @@ RFP_DEPTH = 3  # only prune at depth <= this
 RFP_MARGIN = [0, 100, 200, 300]  # indexed by depth
 
 
+# --- Razoring (architecture.md §9, Milestone 5 extension) ------------------
+#
+# At shallow depths (1-2), if the static evaluation plus a generous margin
+# is still below alpha, the position is likely too bad for any move to
+# recover. Instead of searching the full move tree, drop straight into
+# quiescence to confirm. If quiescence also confirms the score is below
+# alpha, return immediately — no full-width search needed.
+RAZORING_DEPTH = 2  # only razor at depth <= this
+RAZORING_MARGIN = [0, 300, 600]  # indexed by depth
+
+
+# --- Internal Iterative Deepening (IID) (Milestone 5 extension) -----------
+#
+# At PV nodes (alpha+1 < beta) where the TT probe found no best-move hint,
+# move ordering has no "best guess" to put first. IID does a cheap
+# reduced-depth search of this same position, populates the TT with its
+# result, then re-probes for a best move to use as the ordering anchor.
+IID_DEPTH = 4  # only do IID at depth >= this
+IID_REDUCTION = 2  # search at depth - this
+
+
+# --- History gravity -------------------------------------------------------
+#
+# Prevents history table values from growing without bound across many
+# searches. Instead of periodically halving all entries (which adds
+# latency), each update self-limits: the bonus is scaled down as the
+# entry approaches HISTORY_MAX, so values saturate naturally.
+HISTORY_MAX = 8192
+
+
 # --- Public search-parameter/result types (architecture.md §9.3) -----------
 
 
@@ -806,6 +836,18 @@ class Search:
             # capture-sequence (the horizon effect).
             return self._quiescence(board, alpha, beta, ply, ctx)
 
+        # --- Internal Iterative Deepening (IID) ---
+        if (
+            tt_move == NULL_MOVE
+            and depth >= IID_DEPTH
+            and alpha + 1 < beta
+        ):
+            self._negamax(board, depth - IID_REDUCTION, alpha, beta, ply, ctx,
+                          ext_remaining=ext_remaining, prev_move=prev_move)
+            iid_entry = self.tt.probe(board.zobrist_hash)
+            if iid_entry is not None:
+                tt_move = iid_entry.best_move
+
         # --- Null-move pruning (Milestone 5 extension; architecture.md §9) ---
         #
         # Never at the root (`ply > 0`): the root must always produce a real
@@ -856,6 +898,19 @@ class Search:
             # untrustworthy signal and skipped rather than used for a cutoff.
             if null_score >= beta and abs(null_score) < MATE_SCORE - 128:
                 return beta
+
+        # --- Razoring ---
+        if (
+            ply > 0
+            and depth <= RAZORING_DEPTH
+            and not board.in_check()
+            and abs(alpha) < MATE_SCORE - 128
+        ):
+            razor_eval = self.evaluator.evaluate(board)
+            if razor_eval + RAZORING_MARGIN[depth] <= alpha:
+                razor_score = self._quiescence(board, alpha, beta, ply, ctx)
+                if razor_score <= alpha:
+                    return razor_score
 
         # --- Reverse futility pruning (static null-move pruning) --------
         #
@@ -1117,7 +1172,10 @@ class Search:
         if killers[0] != move:
             killers[1] = killers[0]
             killers[0] = move
-        self.history[move_from(move)][move_to(move)] += depth * depth
+        frm, to = move_from(move), move_to(move)
+        bonus = depth * depth
+        entry = self.history[frm][to]
+        self.history[frm][to] = entry + bonus - entry * bonus // HISTORY_MAX
         if prev_move:
             self.countermove[move_from(prev_move)][move_to(prev_move)] = move
 
