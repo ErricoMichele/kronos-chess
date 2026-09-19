@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     import threading
 
 from .attacks import attackers_to
-from .bitboard import iter_bits
+from .bitboard import iter_bits, popcount
 from .board import Board
 from .constants import (
     BISHOP,
@@ -54,6 +54,7 @@ from .move import (
     move_to,
 )
 from .movegen import generate_captures, generate_legal_moves
+from .tablebase import TB_BLESSED_LOSS, TB_CURSED_WIN, TB_LOSS_SCORE, TB_WIN_SCORE, SyzygyProber
 from .transposition import TTFlag, TranspositionTable, score_from_tt, score_to_tt
 
 # --- Null-move pruning constants (architecture.md §9, Milestone 5 extension) -
@@ -298,6 +299,10 @@ CHECK_EXTENSION_PLIES = 1  # depth bonus applied to a move that gives check
 CHECK_EXTENSION_MAX_PLIES = 16  # cumulative per-path budget; see rationale above
 
 
+# --- Syzygy tablebase probing constants (Milestone 5 extension) -----------
+TB_MAX_PIECES = 6  # probe when popcount(occupied) <= this
+
+
 # --- Principal Variation Search (PVS) (architecture.md §9, Milestone 5) ----
 #
 # Standard PVS: a refinement of alpha-beta that exploits move ordering.
@@ -429,6 +434,7 @@ class SearchLimits:
     max_depth: int = 64
     movetime_ms: int | None = None
     nodes: int | None = None
+    multi_pv: int = 1
 
 
 @dataclass
@@ -437,6 +443,7 @@ class SearchInfo:  # one per completed depth, handed to on_info
     score_cp: int
     nodes: int
     pv: list[int]
+    multi_pv_lines: "list[SearchResult] | None" = None
 
 
 @dataclass
@@ -446,6 +453,7 @@ class SearchResult:
     depth: int
     nodes: int
     pv: list[int]
+    multi_pv_lines: "list[SearchResult] | None" = None
 
 
 class _SearchCtx:
@@ -497,11 +505,25 @@ class Search:
     across calls to `.search()` within one game; `new_game()` resets all of
     it for UCI `ucinewgame`."""
 
-    def __init__(self, evaluator: Evaluator, tt_size_mb: int = 64) -> None:
+    def __init__(
+        self,
+        evaluator: Evaluator,
+        tt_size_mb: int = 64,
+        tablebase: SyzygyProber | None = None,
+    ) -> None:
         self.evaluator = evaluator
+        self.tt_size_mb = tt_size_mb
         self.tt = TranspositionTable(tt_size_mb)
         self.killers: list[list[int]] = [[NULL_MOVE, NULL_MOVE] for _ in range(MAX_PLY)]
         self.history: list[list[int]] = [[0] * 64 for _ in range(64)]  # [from][to]
+        self.tablebase = tablebase
+        self._ctx: _SearchCtx | None = None
+
+    def set_deadline(self, deadline: float | None) -> None:
+        """Update the running search's deadline mid-flight (for UCI ponderhit)."""
+        ctx = self._ctx
+        if ctx is not None:
+            ctx.deadline = deadline
 
     def new_game(self) -> None:
         """Called on UCI 'ucinewgame'. Stale TT/killer/history/pawn-cache
@@ -525,6 +547,7 @@ class Search:
     ) -> SearchResult:
         deadline = time.monotonic() + limits.movetime_ms / 1000 if limits.movetime_ms else None
         ctx = _SearchCtx(limits, deadline, stop_event, extra_stop)
+        self._ctx = ctx
 
         # Seed a legal fallback move (roughly ordered, so it's at least a
         # reasonable capture/central move rather than an arbitrary one)
@@ -539,33 +562,67 @@ class Search:
         fallback_move = self._order_moves(root_moves, board, NULL_MOVE, 0)[0] if root_moves else NULL_MOVE
         best = SearchResult(fallback_move, 0, 0, 0, [])
 
-        # `prev_score` feeds `_aspiration_search`'s window center once depth
-        # reaches `ASPIRATION_MIN_DEPTH` (see the ASPIRATION_* constants
-        # block above); its initial value is never actually used as a window
-        # center (depths below that threshold always take the full-window
-        # branch instead), so 0 vs. anything else here makes no difference.
-        prev_score = 0
+        if limits.multi_pv <= 1:
+            # --- Single-PV mode (unchanged behavior) -------------------------
+            prev_score = 0
+            for depth in range(1, limits.max_depth + 1):
+                if depth < ASPIRATION_MIN_DEPTH:
+                    score = self._negamax(board, depth, -INF, INF, 0, ctx)
+                else:
+                    score = self._aspiration_search(board, depth, prev_score, ctx)
+                if ctx.should_stop():
+                    break
+                pv = ctx.pv[0][:ctx.pv_length[0]]
+                best = SearchResult(pv[0] if pv else best.best_move, score, depth, ctx.nodes, pv)
+                prev_score = score
+                if on_info is not None:
+                    on_info(SearchInfo(depth, score, ctx.nodes, pv))
+                if abs(score) >= MATE_SCORE - 128:
+                    break
+            self._ctx = None
+            return best
+
+        # --- Multi-PV mode ---------------------------------------------------
+        num_pvs = min(limits.multi_pv, len(root_moves)) if root_moves else 0
+        if num_pvs == 0:
+            self._ctx = None
+            return best
+
         for depth in range(1, limits.max_depth + 1):
-            if depth < ASPIRATION_MIN_DEPTH:
-                # Too shallow for a previous depth's score to be a
-                # meaningful window center yet -- searched exactly as every
-                # depth was before aspiration windows existed: full width.
-                score = self._negamax(board, depth, -INF, INF, 0, ctx)
-            else:
-                score = self._aspiration_search(board, depth, prev_score, ctx)
-            if ctx.should_stop():
-                break  # partial/unreliable result from an aborted depth: discard entirely
-            # Read the PV from the triangular PV array (stable, built
-            # inside _negamax as it runs) instead of the old TT-walk
-            # approach (_extract_pv), which was fragile against TT
-            # overwrites producing truncated or stale PV lines.
-            pv = ctx.pv[0][:ctx.pv_length[0]]
-            best = SearchResult(pv[0] if pv else best.best_move, score, depth, ctx.nodes, pv)
-            prev_score = score
+            pv_lines: list[SearchResult] = []
+            excluded: set[int] = set()
+            depth_aborted = False
+
+            for _pv_idx in range(num_pvs):
+                score = self._negamax(
+                    board, depth, -INF, INF, 0, ctx,
+                    excluded_root_moves=excluded if excluded else None,
+                )
+                if ctx.should_stop():
+                    depth_aborted = True
+                    break
+                pv = ctx.pv[0][:ctx.pv_length[0]]
+                move = pv[0] if pv else NULL_MOVE
+                pv_lines.append(SearchResult(move, score, depth, ctx.nodes, pv))
+                if move != NULL_MOVE:
+                    excluded.add(move)
+
+            if depth_aborted:
+                break
+
+            pv_lines.sort(key=lambda r: r.score_cp, reverse=True)
+            best = SearchResult(
+                pv_lines[0].best_move, pv_lines[0].score_cp, depth,
+                ctx.nodes, pv_lines[0].pv, multi_pv_lines=pv_lines,
+            )
             if on_info is not None:
-                on_info(SearchInfo(depth, score, ctx.nodes, pv))
-            if abs(score) >= MATE_SCORE - 128:
-                break  # forced mate found; no point searching deeper
+                on_info(SearchInfo(
+                    depth, pv_lines[0].score_cp, ctx.nodes, pv_lines[0].pv,
+                    multi_pv_lines=pv_lines,
+                ))
+            if abs(pv_lines[0].score_cp) >= MATE_SCORE - 128:
+                break
+        self._ctx = None
         return best
 
     # --- Aspiration windows (architecture.md §9.3, Milestone 5 extension) ---
@@ -637,6 +694,7 @@ class Search:
         ctx: _SearchCtx,
         null_ok: bool = True,
         ext_remaining: int | None = None,
+        excluded_root_moves: "set[int] | None" = None,
     ) -> int:
         if ext_remaining is None:
             # Resolved dynamically (not a plain default-parameter value) so
@@ -652,6 +710,24 @@ class Search:
 
         if board.is_fifty_move_draw() or board.is_repetition_draw():
             return DRAW_SCORE
+
+        if (
+            ply > 0
+            and self.tablebase is not None
+            and popcount(board.occupied) <= TB_MAX_PIECES
+        ):
+            wdl = self.tablebase.probe_wdl(board)
+            if wdl is not None:
+                if wdl == 2:
+                    return TB_WIN_SCORE
+                elif wdl == -2:
+                    return TB_LOSS_SCORE
+                elif wdl == 1:
+                    return TB_CURSED_WIN
+                elif wdl == -1:
+                    return TB_BLESSED_LOSS
+                else:
+                    return DRAW_SCORE
 
         alpha_orig = alpha
         entry = self.tt.probe(board.zobrist_hash)
@@ -772,6 +848,11 @@ class Search:
             return -MATE_SCORE + ply if board.in_check() else DRAW_SCORE
 
         self._order_moves(moves, board, tt_move, ply)
+
+        if ply == 0 and excluded_root_moves:
+            moves = [m for m in moves if m not in excluded_root_moves]
+            if not moves:
+                return -INF
 
         # Whether the side to move *here* is in check, computed once and
         # reused by every move's LMR guard (d) and futility guard (b) below,

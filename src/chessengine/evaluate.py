@@ -439,6 +439,69 @@ def endgame_mopup_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- Passed pawns -----------------------------------------------------------
+PASSED_PAWN_BONUS_BY_RANK = (0, 5, 10, 20, 35, 60, 100, 0)
+
+
+def _side_passed_pawns(board: Board, color: int) -> int:
+    pawns = board.pieces[color][PAWN]
+    enemy_pawns = board.pieces[1 - color][PAWN]
+    ahead_rank_mask = _AHEAD_RANK_MASK[color]
+    score = 0
+    for sq in iter_bits(pawns):
+        f, r = file_of(sq), rank_of(sq)
+        span_files = FILE_MASK[f]
+        if f > 0:
+            span_files |= FILE_MASK[f - 1]
+        if f < 7:
+            span_files |= FILE_MASK[f + 1]
+        if not (enemy_pawns & span_files & ahead_rank_mask[r]):
+            score += PASSED_PAWN_BONUS_BY_RANK[r] if color == WHITE else PASSED_PAWN_BONUS_BY_RANK[7 - r]
+    return score
+
+
+def passed_pawn_term(board: Board) -> int:
+    white_score = _side_passed_pawns(board, WHITE) - _side_passed_pawns(board, BLACK)
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
+# --- Bishop pair ------------------------------------------------------------
+BISHOP_PAIR_BONUS_CP = 30
+
+
+def bishop_pair_term(board: Board) -> int:
+    white_bonus = BISHOP_PAIR_BONUS_CP if popcount(board.pieces[WHITE][BISHOP]) >= 2 else 0
+    black_bonus = BISHOP_PAIR_BONUS_CP if popcount(board.pieces[BLACK][BISHOP]) >= 2 else 0
+    white_score = white_bonus - black_bonus
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
+# --- Rook on open/semi-open file -------------------------------------------
+ROOK_OPEN_FILE_BONUS_CP = 20
+ROOK_SEMI_OPEN_FILE_BONUS_CP = 10
+
+
+def _side_rook_open_file(board: Board, color: int) -> int:
+    rooks = board.pieces[color][ROOK]
+    own_pawns = board.pieces[color][PAWN]
+    enemy_pawns = board.pieces[1 - color][PAWN]
+    score = 0
+    for sq in iter_bits(rooks):
+        f = file_of(sq)
+        file_mask = FILE_MASK[f]
+        if not (own_pawns & file_mask):
+            if not (enemy_pawns & file_mask):
+                score += ROOK_OPEN_FILE_BONUS_CP
+            else:
+                score += ROOK_SEMI_OPEN_FILE_BONUS_CP
+    return score
+
+
+def rook_open_file_term(board: Board) -> int:
+    white_score = _side_rook_open_file(board, WHITE) - _side_rook_open_file(board, BLACK)
+    return white_score if board.side_to_move == WHITE else -white_score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -512,6 +575,9 @@ class Weights:
     # king-vs-mating-material shape it's gated to, a larger weight here
     # doesn't risk distorting evaluation anywhere else.)
     endgame_mopup: float = 3.0
+    passed_pawn: float = 1.0
+    bishop_pair: float = 1.0
+    rook_open_file: float = 1.0
 
 
 class CompositeEvaluator:
@@ -537,14 +603,7 @@ class CompositeEvaluator:
 
 
 def default_evaluator() -> CompositeEvaluator:
-    """All five evaluation terms enabled: material+PST, mobility,
-    king_safety, pawn_structure, and endgame_mopup. Each passed its own A/B
-    self-play gate (see each `Weights.*` field's docstring comment for the
-    exact match results). `endgame_mopup` passed a *functional* gate
-    instead (a generic opening-position A/B match can't exercise a term that
-    only ever activates in a bare-king-vs-mating-material endgame -- see
-    `Weights.endgame_mopup`'s docstring comment for the exact
-    positions/results) and is enabled at weight 3.0."""
+    """All eight evaluation terms enabled."""
     return CompositeEvaluator(
         terms={
             "material_pst": material_pst_term,
@@ -552,6 +611,9 @@ def default_evaluator() -> CompositeEvaluator:
             "king_safety": king_safety_term,
             "pawn_structure": pawn_structure_term,
             "endgame_mopup": endgame_mopup_term,
+            "passed_pawn": passed_pawn_term,
+            "bishop_pair": bishop_pair_term,
+            "rook_open_file": rook_open_file_term,
         },
         weights=Weights(
             material_pst=1.0,
@@ -559,5 +621,8 @@ def default_evaluator() -> CompositeEvaluator:
             king_safety=1.0,
             pawn_structure=1.0,
             endgame_mopup=3.0,
+            passed_pawn=1.0,
+            bishop_pair=1.0,
+            rook_open_file=1.0,
         ),
     )

@@ -74,7 +74,13 @@ CORRECTNESS_CASES = [
 def test_pvs_same_best_move(
     fen: str, depth: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PVS is a pure optimisation — it must return the same best move."""
+    """PVS is a pure optimisation — it must return the same best move.
+
+    Futility and RFP are disabled so their alpha-dependent thresholds don't
+    interact with PVS's scout windows to produce different prune decisions."""
+    monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "RFP_DEPTH", 0)
+
     board_pvs = parse_fen(fen)
     result_pvs = Search(default_evaluator()).search(board_pvs, SearchLimits(max_depth=depth))
 

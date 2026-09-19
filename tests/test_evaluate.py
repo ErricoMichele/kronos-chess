@@ -151,10 +151,9 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
 
 
 def test_default_evaluator_agrees_with_all_enabled_terms() -> None:
-    """`default_evaluator()` enables `material_pst`, `mobility`,
-    `king_safety`, and `pawn_structure`, all at weight 1.0, plus
-    `endgame_mopup` at weight 3.0.  Output must equal the exact weighted
-    sum of all five terms on every sample position."""
+    """`default_evaluator()` enables all eight terms.  Output must equal
+    the exact weighted sum on every sample position."""
+    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
@@ -164,6 +163,9 @@ def test_default_evaluator_agrees_with_all_enabled_terms() -> None:
             + king_safety_term(board)
             + pawn_structure_term(board)
             + int(3.0 * endgame_mopup_term(board))
+            + passed_pawn_term(board)
+            + bishop_pair_term(board)
+            + rook_open_file_term(board)
         )
         assert evaluator.evaluate(board) == expected
 
@@ -307,15 +309,9 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
     assert evaluator.evaluate(board) == material_pst_term(board)
 
 
-def test_default_evaluator_enables_all_five_terms() -> None:
-    """`default_evaluator()` enables all five registered terms at their
-    documented weights: `material_pst`, `mobility`, `king_safety`, and
-    `pawn_structure` each at 1.0 (each validated by its own A/B self-play
-    match -- see `Weights.*`'s docstring comments in evaluate.py), and
-    `endgame_mopup` at 3.0 (validated by its own *functional* gate -- see
-    `Weights.endgame_mopup`'s docstring comment for the exact positions/
-    results). Pinned field by field so an accidentally changed weight would
-    fail this test."""
+def test_default_evaluator_enables_all_eight_terms() -> None:
+    """All eight terms enabled at their documented weights."""
+    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term
     evaluator = default_evaluator()
 
     assert set(evaluator.terms) == {
@@ -324,18 +320,22 @@ def test_default_evaluator_enables_all_five_terms() -> None:
         "king_safety",
         "pawn_structure",
         "endgame_mopup",
+        "passed_pawn",
+        "bishop_pair",
+        "rook_open_file",
     }
-    assert evaluator.terms["material_pst"] is material_pst_term
-    assert evaluator.terms["mobility"] is mobility_term
-    assert evaluator.terms["king_safety"] is king_safety_term
-    assert evaluator.terms["pawn_structure"] is pawn_structure_term
-    assert evaluator.terms["endgame_mopup"] is endgame_mopup_term
+    assert evaluator.terms["passed_pawn"] is passed_pawn_term
+    assert evaluator.terms["bishop_pair"] is bishop_pair_term
+    assert evaluator.terms["rook_open_file"] is rook_open_file_term
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
     assert evaluator.weights.king_safety == 1.0
     assert evaluator.weights.pawn_structure == 1.0
     assert evaluator.weights.endgame_mopup == 3.0
+    assert evaluator.weights.passed_pawn == 1.0
+    assert evaluator.weights.bishop_pair == 1.0
+    assert evaluator.weights.rook_open_file == 1.0
 
 
 # --- mobility_term ------------------------------------------------------

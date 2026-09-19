@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from typing import TextIO
 
 from . import book, fen, movegen
@@ -32,6 +33,7 @@ from .constants import WHITE
 from .evaluate import default_evaluator
 from .move import move_to_uci
 from .search import Search, SearchInfo, SearchLimits
+from .tablebase import SyzygyProber
 
 # --- `go` time/limit token parsing (architecture.md §12) --------------------
 #
@@ -177,6 +179,10 @@ class UCIEngine:
         self.stop_event: threading.Event = threading.Event()
         self.search_thread: threading.Thread | None = None
         self.quit: bool = False
+        self.ponder_enabled: bool = True
+        self.pondering: bool = False
+        self._ponder_limits: SearchLimits | None = None
+        self.multi_pv: int = 1
 
     # --- Main loop -----------------------------------------------------------
 
@@ -214,6 +220,9 @@ class UCIEngine:
         out.write("id name death-Token 0.1\n")
         out.write("id author Francesco Errico\n")
         out.write("option name Hash type spin default 64 min 1 max 1024\n")
+        out.write("option name Ponder type check default true\n")
+        out.write("option name MultiPV type spin default 1 min 1 max 500\n")
+        out.write("option name SyzygyPath type string default \n")
         out.write("uciok\n")
         out.flush()
 
@@ -222,16 +231,34 @@ class UCIEngine:
         out.flush()
 
     def cmd_setoption(self, args: list[str], out: TextIO) -> None:
-        """Only `Hash` (transposition table size, in MB) is a recognized
-        option; everything else is silently ignored. Changing `Hash`
-        rebuilds `Search` (a fresh, empty TT at the new size) but keeps the
-        same evaluator — this drops killers/history too, which is fine
-        since `setoption` is a rare, out-of-game-flow event, not something
-        a GUI does mid-search."""
-        if "Hash" not in args or "value" not in args:
+        """Recognized options: Hash, Ponder, MultiPV."""
+        if "name" not in args or "value" not in args:
             return
-        size_mb = int(args[args.index("value") + 1])
-        self.search = Search(self.search.evaluator, tt_size_mb=size_mb)
+        name_idx = args.index("name")
+        value_idx = args.index("value")
+        if value_idx + 1 >= len(args):
+            return
+        name = " ".join(args[name_idx + 1 : value_idx])
+        value_str = args[value_idx + 1]
+
+        if name == "Hash":
+            self.search = Search(
+                self.search.evaluator,
+                tt_size_mb=int(value_str),
+                tablebase=self.search.tablebase,
+            )
+        elif name == "Ponder":
+            self.ponder_enabled = value_str.lower() == "true"
+        elif name == "MultiPV":
+            self.multi_pv = max(1, int(value_str))
+        elif name == "SyzygyPath":
+            path = " ".join(args[value_idx + 1:])
+            tb = SyzygyProber(path) if path else None
+            self.search = Search(
+                self.search.evaluator,
+                tt_size_mb=self.search.tt_size_mb,
+                tablebase=tb,
+            )
 
     def cmd_ucinewgame(self, args: list[str], out: TextIO) -> None:
         self._stop_and_join_search()
@@ -273,41 +300,35 @@ class UCIEngine:
         `bestmove` output out of order. Called defensively from
         `cmd_ucinewgame`, `cmd_position`, and `cmd_go` so those races
         can't happen regardless of caller compliance."""
+        self.pondering = False
         if self.search_thread is not None and self.search_thread.is_alive():
             self.stop_event.set()
             self.search_thread.join()
 
     def cmd_go(self, args: list[str], out: TextIO) -> None:
-        """Consult the opening book first (architecture.md §15): if
-        `book.probe_book` finds an entry for the *current* position, reply
-        with `bestmove` immediately and return without ever touching
-        `parse_go_limits`/`Search.search` or spawning a search thread — the
-        book is strictly a pre-search gate, not a participant in the search
-        itself, and `Search.search`'s own contract is untouched by this.
-
-        Otherwise, parse `go`'s limits and hand the search off to a
-        background thread so this method (and thus the main stdin-reading
-        loop) returns immediately — `stop`/`quit` must never wait on a long
-        search call stack to unwind on its own (§9.3, §12)."""
+        """Book lookup, then search. Supports `go ponder` for pondering."""
         self._stop_and_join_search()
 
-        book_move = book.probe_book(self.board)
-        if book_move is not None:
-            # No search thread is spawned on this path, so there must be
-            # none left over for a later `stop`/`quit` to (harmlessly, but
-            # confusingly) join either: `_stop_and_join_search` above only
-            # joins a thread it finds *alive*, so `self.search_thread` can
-            # still be a finished thread object from a previous `go`.
-            # Clear it so this `go` leaves the same "no search in flight"
-            # state a real search leaves once it reports `bestmove`.
-            self.search_thread = None
-            out.write(f"bestmove {move_to_uci(book_move)}\n")
-            out.flush()
-            return
+        is_ponder = "ponder" in args
+
+        if not is_ponder:
+            book_move = book.probe_book(self.board)
+            if book_move is not None:
+                self.search_thread = None
+                out.write(f"bestmove {move_to_uci(book_move)}\n")
+                out.flush()
+                return
 
         limits = parse_go_limits(
             args, self.board.side_to_move, self.board.fullmove_number
         )
+        limits.multi_pv = self.multi_pv
+
+        if is_ponder:
+            self._ponder_limits = limits
+            limits = SearchLimits(max_depth=limits.max_depth, multi_pv=self.multi_pv)
+            self.pondering = True
+
         self.stop_event = threading.Event()
         self.search_thread = threading.Thread(
             target=self._search_and_report, args=(limits, out), daemon=True
@@ -315,9 +336,20 @@ class UCIEngine:
         self.search_thread.start()
 
     def cmd_stop(self, args: list[str], out: TextIO) -> None:
+        self.pondering = False
         self.stop_event.set()
         if self.search_thread is not None:
             self.search_thread.join()
+
+    def cmd_ponderhit(self, args: list[str], out: TextIO) -> None:
+        """Switch from pondering to normal timed search."""
+        if not self.pondering:
+            return
+        self.pondering = False
+        if self._ponder_limits is not None and self._ponder_limits.movetime_ms is not None:
+            deadline = time.monotonic() + self._ponder_limits.movetime_ms / 1000
+            self.search.set_deadline(deadline)
+        self._ponder_limits = None
 
     def cmd_quit(self, args: list[str], out: TextIO) -> None:
         # Must join the search thread before returning, exactly like
@@ -332,23 +364,31 @@ class UCIEngine:
         self.quit = True
 
     def _search_and_report(self, limits: SearchLimits, out: TextIO) -> None:
-        """Runs on the background thread spawned by `cmd_go`. The only
-        cross-thread state touched is `self.stop_event` (safe to `.set()`
-        from another thread) and `self.search`/`self.board` (read-only here;
-        a compliant GUI always sends `stop` or waits for `bestmove` before
-        the next `position`/`go`, which is what makes this safe without an
-        explicit lock, §12)."""
+        """Runs on the background thread spawned by `cmd_go`."""
 
         def on_info(info: SearchInfo) -> None:
-            pv_str = " ".join(move_to_uci(m) for m in info.pv)
-            out.write(
-                f"info depth {info.depth} score cp {info.score_cp} "
-                f"nodes {info.nodes} pv {pv_str}\n"
-            )
+            if info.multi_pv_lines:
+                for k, line in enumerate(info.multi_pv_lines, 1):
+                    pv_str = " ".join(move_to_uci(m) for m in line.pv)
+                    out.write(
+                        f"info depth {info.depth} score cp {line.score_cp} "
+                        f"nodes {info.nodes} multipv {k} pv {pv_str}\n"
+                    )
+            else:
+                pv_str = " ".join(move_to_uci(m) for m in info.pv)
+                out.write(
+                    f"info depth {info.depth} score cp {info.score_cp} "
+                    f"nodes {info.nodes} pv {pv_str}\n"
+                )
             out.flush()
 
         result = self.search.search(
             self.board, limits, stop_event=self.stop_event, on_info=on_info
         )
-        out.write(f"bestmove {move_to_uci(result.best_move)}\n")
+        bm = move_to_uci(result.best_move)
+        if self.ponder_enabled and len(result.pv) >= 2:
+            pm = move_to_uci(result.pv[1])
+            out.write(f"bestmove {bm} ponder {pm}\n")
+        else:
+            out.write(f"bestmove {bm}\n")
         out.flush()

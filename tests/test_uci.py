@@ -336,3 +336,117 @@ def test_time_management_does_not_affect_depth_or_infinite() -> None:
     args_inf = "infinite".split()
     limits_inf = parse_go_limits(args_inf, WHITE, move_number=10)
     assert limits_inf.movetime_ms is None
+
+
+# --- Pondering (go ponder / ponderhit) ------------------------------------
+
+
+def test_bestmove_includes_ponder_move_when_pv_has_two_moves() -> None:
+    """When the search produces a PV with >= 2 moves and Ponder is
+    enabled, bestmove should include 'ponder <move>'."""
+    engine = UCIEngine()
+    out = io.StringIO()
+
+    engine.cmd_position(["startpos", "moves", "e2e4", "g8f6"], out)
+    engine.cmd_go(["depth", "6"], out)
+
+    deadline = time.monotonic() + _POLL_TIMEOUT_S
+    while "bestmove" not in out.getvalue() and time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+    if engine.search_thread is not None:
+        engine.search_thread.join(timeout=5.0)
+
+    captured = out.getvalue()
+    lines = _lines(captured)
+
+    info_lines = [l for l in lines if l.startswith("info ") and " pv " in l]
+    assert info_lines, f"no info lines with PV found: {captured}"
+    last_pv_str = info_lines[-1][info_lines[-1].index(" pv ") + 4 :]
+    last_pv_moves = last_pv_str.split()
+    assert len(last_pv_moves) >= 2, (
+        f"PV too short at depth 6 (expected >= 2): {last_pv_moves}"
+    )
+
+    bestmove_lines = [l for l in lines if l.startswith("bestmove ")]
+    assert len(bestmove_lines) == 1, captured
+    parts = bestmove_lines[0].split()
+    assert len(parts) >= 4 and parts[2] == "ponder", (
+        f"expected 'bestmove X ponder Y', got: {bestmove_lines[0]!r}"
+    )
+    assert _UCI_MOVE_RE.match(parts[1]), f"malformed bestmove token: {parts[1]!r}"
+    assert _UCI_MOVE_RE.match(parts[3]), f"malformed ponder token: {parts[3]!r}"
+
+
+def test_go_ponder_does_not_stop_on_time() -> None:
+    """'go ponder' should search indefinitely, ignoring time limits."""
+    engine = UCIEngine()
+    out = io.StringIO()
+
+    engine.cmd_position(["startpos", "moves", "e2e4", "e7e5"], out)
+    engine.cmd_go(["ponder", "movetime", "1"], out)
+
+    time.sleep(0.3)
+
+    assert engine.pondering is True
+    assert engine.search_thread is not None and engine.search_thread.is_alive()
+    assert "bestmove" not in out.getvalue()
+
+    engine.cmd_stop([], out)
+    deadline = time.monotonic() + _POLL_TIMEOUT_S
+    while "bestmove" not in out.getvalue() and time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+    assert "bestmove" in out.getvalue()
+
+
+def test_ponderhit_transitions_to_timed_search() -> None:
+    """After 'ponderhit', the engine applies the time limits from the
+    original 'go ponder' command and the search finishes on its own."""
+    engine = UCIEngine()
+    out = io.StringIO()
+
+    engine.cmd_position(["startpos", "moves", "e2e4", "e7e5"], out)
+    engine.cmd_go(["ponder", "movetime", "100"], out)
+
+    time.sleep(0.05)
+    assert engine.pondering is True
+
+    engine.cmd_ponderhit([], out)
+    assert engine.pondering is False
+
+    deadline = time.monotonic() + _POLL_TIMEOUT_S
+    while "bestmove" not in out.getvalue() and time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+    assert "bestmove" in out.getvalue()
+
+    lines = _lines(out.getvalue())
+    bestmove_lines = [line for line in lines if line.startswith("bestmove ")]
+    assert len(bestmove_lines) == 1
+    move_token = bestmove_lines[0].split()[1]
+    assert _UCI_MOVE_RE.match(move_token), f"malformed bestmove token: {move_token!r}"
+
+
+def test_stop_during_pondering_outputs_bestmove() -> None:
+    """'stop' during pondering should terminate the search and produce
+    a well-formed bestmove line."""
+    engine = UCIEngine()
+    out = io.StringIO()
+
+    engine.cmd_position(["startpos", "moves", "e2e4", "e7e5"], out)
+    engine.cmd_go(["ponder", "wtime", "60000", "btime", "60000"], out)
+
+    time.sleep(0.1)
+    assert engine.pondering is True
+
+    engine.cmd_stop([], out)
+    assert engine.pondering is False
+
+    deadline = time.monotonic() + _POLL_TIMEOUT_S
+    while "bestmove" not in out.getvalue() and time.monotonic() < deadline:
+        time.sleep(_POLL_INTERVAL_S)
+
+    captured = out.getvalue()
+    lines = _lines(captured)
+    bestmove_lines = [line for line in lines if line.startswith("bestmove ")]
+    assert len(bestmove_lines) == 1, captured
+    move_token = bestmove_lines[0].split()[1]
+    assert _UCI_MOVE_RE.match(move_token), f"malformed bestmove token: {move_token!r}"
