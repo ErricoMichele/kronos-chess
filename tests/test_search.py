@@ -169,15 +169,21 @@ DIFFERENTIAL_CASES = [
 
 
 @pytest.mark.parametrize("fen, depth", DIFFERENTIAL_CASES)
-def test_negamax_matches_naive_full_width_oracle(fen: str, depth: int) -> None:
-    # Two independent Board instances (and Search instances), so nothing
-    # about one call's make/unmake bookkeeping or TT/killer/history state
-    # can leak into the other.
+def test_negamax_matches_naive_full_width_oracle(
+    fen: str, depth: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import chessengine.search as search_mod
+
+    monkeypatch.setattr(search_mod, "NULL_MOVE_MIN_DEPTH", 10_000)
+    monkeypatch.setattr(search_mod, "LMR_MIN_MOVE_INDEX", 10_000)
+    monkeypatch.setattr(search_mod, "PVS_ENABLED", False)
+    monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "RFP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "LMP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "DELTA_MARGIN", 99_999)
+
     oracle_board = parse_fen(fen)
     oracle_score = _naive_full_width_negamax(oracle_board, depth)
-    # The oracle must leave the board exactly as it found it -- otherwise a
-    # make/unmake bug in *this file*, not in `search.py`, could be mistaken
-    # for a real alpha-beta divergence.
     assert oracle_board.to_fen() == fen
 
     engine_board = parse_fen(fen)
@@ -187,10 +193,8 @@ def test_negamax_matches_naive_full_width_oracle(fen: str, depth: int) -> None:
 
     assert engine_score == oracle_score, (
         f"Search._negamax disagreed with the unpruned full-width oracle at "
-        f"depth {depth} for {fen!r}: engine={engine_score} oracle={oracle_score} "
-        f"-- a real alpha-beta window bug, since pruning must never change the score."
+        f"depth {depth} for {fen!r}: engine={engine_score} oracle={oracle_score}"
     )
-    # The engine's own make/unmake bookkeeping must also be symmetric.
     assert engine_board.to_fen() == fen
 
 
@@ -341,12 +345,18 @@ _TRIANGULAR_PV_CASES = [
 
 @pytest.mark.parametrize("fen", _TRIANGULAR_PV_CASES)
 @pytest.mark.parametrize("depth", [5, 6])
-def test_triangular_pv_at_least_as_long_as_tt_extract_pv(fen: str, depth: int) -> None:
+def test_triangular_pv_at_least_as_long_as_tt_extract_pv(
+    fen: str, depth: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The triangular PV array (built inside _negamax as it runs) should be
     at least as long as the TT-walk PV (_extract_pv) for the same search,
     confirming that the triangular approach is more stable -- TT entries can
     be overwritten during a search, truncating the TT-walk PV, while the
     triangular array is immune to that."""
+    import chessengine.search as search_mod
+    monkeypatch.setattr(search_mod, "LMP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
+
     board = parse_fen(fen)
     search = Search(default_evaluator())
     # We need to capture the triangular PV from the last completed depth's

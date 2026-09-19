@@ -303,6 +303,35 @@ CHECK_EXTENSION_MAX_PLIES = 16  # cumulative per-path budget; see rationale abov
 TB_MAX_PIECES = 6  # probe when popcount(occupied) <= this
 
 
+# --- Delta pruning in quiescence search ------------------------------------
+#
+# If the stand-pat score plus the maximum material gain from a capture (the
+# captured piece value) plus a safety margin is still below alpha, the
+# capture cannot possibly raise alpha — skip it entirely. The margin
+# accounts for positional bonuses that the static eval might add on top of
+# the raw material exchange.
+DELTA_MARGIN = 200  # centipawns of positional slack
+
+
+# --- Late Move Pruning (LMP) -----------------------------------------------
+#
+# At low depths, after we've searched the first N moves without improving
+# alpha, the remaining quiet (non-capture, non-promotion) moves are very
+# unlikely to be any good — prune them outright. The threshold grows with
+# depth: deeper searches are allowed more moves before pruning kicks in.
+# Only applied at non-PV, non-check nodes.
+LMP_DEPTH = 3  # maximum depth for LMP (0 disables)
+LMP_BASE = 3   # at depth 1, prune after this many quiet moves
+LMP_SCALE = 2  # each extra depth adds this many moves to the threshold
+
+
+# --- Countermove heuristic --------------------------------------------------
+#
+# Tracks which move refuted (caused a beta-cutoff against) the opponent's
+# previous move. Used as an additional move-ordering signal after TT move,
+# captures, and killers.
+
+
 # --- Principal Variation Search (PVS) (architecture.md §9, Milestone 5) ----
 #
 # Standard PVS: a refinement of alpha-beta that exploits move ordering.
@@ -516,6 +545,7 @@ class Search:
         self.tt = TranspositionTable(tt_size_mb)
         self.killers: list[list[int]] = [[NULL_MOVE, NULL_MOVE] for _ in range(MAX_PLY)]
         self.history: list[list[int]] = [[0] * 64 for _ in range(64)]  # [from][to]
+        self.countermove: list[list[int]] = [[NULL_MOVE] * 64 for _ in range(64)]  # [prev_from][prev_to]
         self.tablebase = tablebase
         self._ctx: _SearchCtx | None = None
 
@@ -531,6 +561,7 @@ class Search:
         self.tt.clear()
         self.killers = [[NULL_MOVE, NULL_MOVE] for _ in range(MAX_PLY)]
         self.history = [[0] * 64 for _ in range(64)]
+        self.countermove = [[NULL_MOVE] * 64 for _ in range(64)]
         if hasattr(self.evaluator, "pawn_cache"):
             self.evaluator.pawn_cache.clear()
 
@@ -695,6 +726,7 @@ class Search:
         null_ok: bool = True,
         ext_remaining: int | None = None,
         excluded_root_moves: "set[int] | None" = None,
+        prev_move: int = 0,
     ) -> int:
         if ext_remaining is None:
             # Resolved dynamically (not a plain default-parameter value) so
@@ -847,7 +879,8 @@ class Search:
         if not moves:
             return -MATE_SCORE + ply if board.in_check() else DRAW_SCORE
 
-        self._order_moves(moves, board, tt_move, ply)
+        cm_hint = self.countermove[move_from(prev_move)][move_to(prev_move)] if prev_move else NULL_MOVE
+        self._order_moves(moves, board, tt_move, ply, countermove_hint=cm_hint)
 
         if ply == 0 and excluded_root_moves:
             moves = [m for m in moves if m not in excluded_root_moves]
@@ -871,6 +904,8 @@ class Search:
             futile = static_eval + FUTILITY_MARGIN[depth] <= alpha
 
         best_score, best_move = -INF, moves[0]
+        quiet_count = 0
+        lmp_threshold = LMP_BASE + LMP_SCALE * depth if LMP_DEPTH and depth <= LMP_DEPTH else 0
 
         pvs_ok = PVS_ENABLED and ply > 0 and alpha + 1 < beta
 
@@ -890,17 +925,30 @@ class Search:
                 board.unmake_move()
                 continue
 
-            # --- Late move reductions (Milestone 5 extension; see the
-            # LMR_* constants block above for the full guard-by-guard
-            # rationale). Every guard must hold or this move is searched at
-            # the normal, unreduced depth like any other move.
+            is_quiet = not is_capture(move) and not is_promotion(move)
+            if is_quiet:
+                quiet_count += 1
+
+            # --- Late Move Pruning (LMP) ---
+            if (
+                lmp_threshold
+                and ply > 0
+                and is_quiet
+                and quiet_count > lmp_threshold
+                and not in_check_before
+                and not gives_check
+                and move != tt_move
+                and best_score > -MATE_SCORE + 128
+            ):
+                board.unmake_move()
+                continue
+
             reduce_this_move = (
                 ply > 0
                 and i >= LMR_MIN_MOVE_INDEX
                 and depth >= LMR_MIN_DEPTH
                 and not in_check_before
-                and not is_capture(move)
-                and not is_promotion(move)
+                and is_quiet
                 and not gives_check
             )
             reduction = _lmr_reduction(depth, i) if reduce_this_move else 0
@@ -914,7 +962,6 @@ class Search:
             child_ext_remaining = ext_remaining - extend
 
             if pvs_ok and i > 0:
-                # --- PVS path: zero-width scout first ---
                 score = -self._negamax(
                     board,
                     depth - 1 - reduction + extend,
@@ -923,9 +970,9 @@ class Search:
                     ply + 1,
                     ctx,
                     ext_remaining=child_ext_remaining,
+                    prev_move=move,
                 )
 
-                # LMR re-search (still zero-width)
                 if reduction and not ctx.should_stop() and score > alpha:
                     score = -self._negamax(
                         board,
@@ -935,9 +982,9 @@ class Search:
                         ply + 1,
                         ctx,
                         ext_remaining=child_ext_remaining,
+                        prev_move=move,
                     )
 
-                # PVS re-search (full window)
                 if not ctx.should_stop() and score > alpha and score < beta:
                     score = -self._negamax(
                         board,
@@ -947,9 +994,9 @@ class Search:
                         ply + 1,
                         ctx,
                         ext_remaining=child_ext_remaining,
+                        prev_move=move,
                     )
             else:
-                # --- Full-window path: first move, root, or PVS disabled ---
                 score = -self._negamax(
                     board,
                     depth - 1 - reduction + extend,
@@ -958,6 +1005,7 @@ class Search:
                     ply + 1,
                     ctx,
                     ext_remaining=child_ext_remaining,
+                    prev_move=move,
                 )
                 if reduction and not ctx.should_stop() and score > alpha:
                     score = -self._negamax(
@@ -968,6 +1016,7 @@ class Search:
                         ply + 1,
                         ctx,
                         ext_remaining=child_ext_remaining,
+                        prev_move=move,
                     )
 
             board.unmake_move()
@@ -981,7 +1030,7 @@ class Search:
                 ctx.pv_length[ply] = 1 + ctx.pv_length[ply + 1]
             alpha = max(alpha, score)
             if alpha >= beta:
-                self._record_cutoff(move, depth, ply)  # killers/history, §9.4
+                self._record_cutoff(move, depth, ply, prev_move)
                 break
 
         flag = (
@@ -1020,7 +1069,15 @@ class Search:
         alpha = max(alpha, stand_pat)
 
         for move in self._order_moves(generate_captures(board), board, NULL_MOVE, ply):
-            if not see_ge(board, move, 0):  # SEE-based pruning: skip clearly-losing captures
+            if not see_ge(board, move, 0):
+                continue
+            flag = move_flag(move)
+            if flag == EN_PASSANT:
+                captured_value = PIECE_VALUE[PAWN]
+            else:
+                victim = board.mailbox[move_to(move)]
+                captured_value = PIECE_VALUE[piece_type_of(victim)] if victim != NO_PIECE else 0
+            if stand_pat + captured_value + DELTA_MARGIN < alpha:
                 continue
             board.make_move(move)
             score = -self._quiescence(board, -beta, -alpha, ply + 1, ctx)
@@ -1032,33 +1089,28 @@ class Search:
 
     # --- Move ordering (architecture.md §9.4) -------------------------------
 
-    def _order_moves(self, moves: list[int], board: Board, tt_move: int, ply: int) -> list[int]:
-        """Sorts `moves` in place, highest priority first:
-
-        1. The TT's stored `best_move` for this position, if any.
-        2. Captures ranked by MVV-LVA (`victim_value * 16 - attacker_value`).
-        3. Killer moves: up to two quiet moves per ply that most recently
-           caused a beta cutoff at this ply in a sibling node.
-        4. History heuristic (`self.history[frm][to]`) as the tiebreak.
-        """
+    def _order_moves(
+        self, moves: list[int], board: Board, tt_move: int, ply: int,
+        countermove_hint: int = 0,
+    ) -> list[int]:
         killers = self.killers[ply]
+        cm = countermove_hint
 
         def key(move: int) -> tuple[int, int]:
             if move == tt_move:
-                return (3, 0)
+                return (4, 0)
             if is_capture(move):
-                return (2, _mvv_lva_score(board, move))
+                return (3, _mvv_lva_score(board, move))
             if move == killers[0] or move == killers[1]:
+                return (2, 0)
+            if move == cm:
                 return (1, 0)
             return (0, self.history[move_from(move)][move_to(move)])
 
         moves.sort(key=key, reverse=True)
         return moves
 
-    def _record_cutoff(self, move: int, depth: int, ply: int) -> None:
-        """Called on a beta cutoff: updates killers/history only for quiet
-        moves — captures already get MVV-LVA ordering and don't need history
-        bookkeeping."""
+    def _record_cutoff(self, move: int, depth: int, ply: int, prev_move: int = 0) -> None:
         if is_capture(move):
             return
         killers = self.killers[ply]
@@ -1066,6 +1118,8 @@ class Search:
             killers[1] = killers[0]
             killers[0] = move
         self.history[move_from(move)][move_to(move)] += depth * depth
+        if prev_move:
+            self.countermove[move_from(prev_move)][move_to(prev_move)] = move
 
     # --- Principal variation extraction (architecture.md §9.3) --------------
     #

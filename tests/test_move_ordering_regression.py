@@ -83,7 +83,7 @@ class _UnorderedSearch(Search):
     from `Search`, so this isolates *only* the move-ordering variable.
     """
 
-    def _order_moves(self, moves: list[int], board: Board, tt_move: int, ply: int) -> list[int]:
+    def _order_moves(self, moves: list[int], board: Board, tt_move: int, ply: int, **kwargs) -> list[int]:
         return moves
 
 

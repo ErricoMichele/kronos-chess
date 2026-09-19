@@ -410,6 +410,8 @@ def test_lmr_re_search_keeps_extreme_reduction_identical_to_unpatched_reference(
     monkeypatch.setattr(search_mod, "PVS_ENABLED", False)
     monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
     monkeypatch.setattr(search_mod, "RFP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "LMP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "DELTA_MARGIN", 99_999)
 
     board_ref = parse_fen(fen)
     reference = _FullWidthSearch(default_evaluator()).search(board_ref, SearchLimits(max_depth=depth))

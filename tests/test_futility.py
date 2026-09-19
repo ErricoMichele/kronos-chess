@@ -93,6 +93,8 @@ def test_futility_reduces_node_count(
 
     Both searches use _negamax directly with a full (-INF, INF) window to
     eliminate aspiration window variability from the comparison."""
+    monkeypatch.setattr(search_mod, "LMP_DEPTH", 0)
+
     board_enabled = parse_fen(fen)
     search_enabled = Search(default_evaluator())
     ctx_enabled = _SearchCtx(
@@ -102,8 +104,6 @@ def test_futility_reduces_node_count(
     nodes_enabled = ctx_enabled.nodes
     assert board_enabled.to_fen() == fen
 
-    # Disable futility pruning by setting FUTILITY_DEPTH to 0 (no depth
-    # qualifies, so the `depth <= FUTILITY_DEPTH` guard never holds).
     monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
     board_disabled = parse_fen(fen)
     search_disabled = Search(default_evaluator())

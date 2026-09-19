@@ -62,6 +62,11 @@ def _lmr_and_null_move_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     isolating aspiration windows' own behavior from either heuristic."""
     monkeypatch.setattr(search_mod, "LMR_MIN_MOVE_INDEX", 10_000)
     monkeypatch.setattr(search_mod, "NULL_MOVE_MIN_DEPTH", 10_000)
+    monkeypatch.setattr(search_mod, "PVS_ENABLED", False)
+    monkeypatch.setattr(search_mod, "FUTILITY_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "RFP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "LMP_DEPTH", 0)
+    monkeypatch.setattr(search_mod, "DELTA_MARGIN", 99_999)
 
 
 # --- 1. Aspiration windows are exact, in isolation from LMR/null-move -------
