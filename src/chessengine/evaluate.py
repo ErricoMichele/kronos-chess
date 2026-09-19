@@ -17,7 +17,7 @@ from typing import Callable, Protocol
 
 from . import attacks
 from .attacks import KING_ATTACKS, KNIGHT_ATTACKS, bishop_attacks, queen_attacks, rook_attacks
-from .bitboard import iter_bits, popcount
+from .bitboard import iter_bits, lsb_index, popcount
 from .board import Board
 from .constants import (
     BISHOP,
@@ -502,6 +502,50 @@ def rook_open_file_term(board: Board) -> int:
     return white_score if board.side_to_move == WHITE else -white_score
 
 
+# --- King activity in endgame -----------------------------------------------
+#
+# In the endgame the king must centralize rather than hide behind pawns.
+# Game phase is computed from non-pawn material (knights=1, bishops=1,
+# rooks=2, queens=4, max=24 for both sides). When phase drops below
+# KING_ACTIVITY_PHASE_THRESHOLD the king gets a bonus for proximity to
+# the center, scaled linearly as the material decreases.
+
+KING_ACTIVITY_PHASE_THRESHOLD = 12  # below this, bonus kicks in
+KING_ACTIVITY_CP = 5  # centipawns per "closeness to center" unit (max 3)
+
+_PHASE_WEIGHTS = {KNIGHT: 1, BISHOP: 1, ROOK: 2, QUEEN: 4}
+
+_CENTER_DIST = []
+for _sq in range(64):
+    _f = _sq & 7
+    _r = _sq >> 3
+    _CENTER_DIST.append(max(abs(_f - 3.5) - 0.5, abs(_r - 3.5) - 0.5))
+
+
+def _game_phase(board: Board) -> int:
+    phase = 0
+    for ptype, pw in _PHASE_WEIGHTS.items():
+        phase += popcount(board.pieces[WHITE][ptype]) * pw
+        phase += popcount(board.pieces[BLACK][ptype]) * pw
+    return phase
+
+
+def _king_center_closeness(board: Board, color: int) -> int:
+    ksq = lsb_index(board.pieces[color][KING])
+    return int(3 - _CENTER_DIST[ksq])
+
+
+def king_activity_term(board: Board) -> int:
+    phase = _game_phase(board)
+    if phase >= KING_ACTIVITY_PHASE_THRESHOLD:
+        return 0
+    scale = KING_ACTIVITY_PHASE_THRESHOLD - phase
+    w_close = _king_center_closeness(board, WHITE)
+    b_close = _king_center_closeness(board, BLACK)
+    score = KING_ACTIVITY_CP * scale * (w_close - b_close) // KING_ACTIVITY_PHASE_THRESHOLD
+    return score if board.side_to_move == WHITE else -score
+
+
 # --- 10.2 `CompositeEvaluator` and the extension path -----------------------
 
 
@@ -578,6 +622,7 @@ class Weights:
     passed_pawn: float = 1.0
     bishop_pair: float = 1.0
     rook_open_file: float = 1.0
+    king_activity: float = 1.0
 
 
 class CompositeEvaluator:
@@ -614,6 +659,7 @@ def default_evaluator() -> CompositeEvaluator:
             "passed_pawn": passed_pawn_term,
             "bishop_pair": bishop_pair_term,
             "rook_open_file": rook_open_file_term,
+            "king_activity": king_activity_term,
         },
         weights=Weights(
             material_pst=1.0,
@@ -624,5 +670,6 @@ def default_evaluator() -> CompositeEvaluator:
             passed_pawn=1.0,
             bishop_pair=1.0,
             rook_open_file=1.0,
+            king_activity=1.0,
         ),
     )

@@ -151,9 +151,9 @@ def test_default_evaluator_negates_under_color_flip_mirror() -> None:
 
 
 def test_default_evaluator_agrees_with_all_enabled_terms() -> None:
-    """`default_evaluator()` enables all eight terms.  Output must equal
+    """`default_evaluator()` enables all nine terms.  Output must equal
     the exact weighted sum on every sample position."""
-    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term
+    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term, king_activity_term
     evaluator = default_evaluator()
     for fen in SYMMETRY_FENS:
         board = parse_fen(fen)
@@ -166,6 +166,7 @@ def test_default_evaluator_agrees_with_all_enabled_terms() -> None:
             + passed_pawn_term(board)
             + bishop_pair_term(board)
             + rook_open_file_term(board)
+            + king_activity_term(board)
         )
         assert evaluator.evaluate(board) == expected
 
@@ -309,9 +310,9 @@ def test_composite_evaluator_ignores_unregistered_weights_fields() -> None:
     assert evaluator.evaluate(board) == material_pst_term(board)
 
 
-def test_default_evaluator_enables_all_eight_terms() -> None:
-    """All eight terms enabled at their documented weights."""
-    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term
+def test_default_evaluator_enables_all_nine_terms() -> None:
+    """All nine terms enabled at their documented weights."""
+    from chessengine.evaluate import passed_pawn_term, bishop_pair_term, rook_open_file_term, king_activity_term
     evaluator = default_evaluator()
 
     assert set(evaluator.terms) == {
@@ -323,10 +324,12 @@ def test_default_evaluator_enables_all_eight_terms() -> None:
         "passed_pawn",
         "bishop_pair",
         "rook_open_file",
+        "king_activity",
     }
     assert evaluator.terms["passed_pawn"] is passed_pawn_term
     assert evaluator.terms["bishop_pair"] is bishop_pair_term
     assert evaluator.terms["rook_open_file"] is rook_open_file_term
+    assert evaluator.terms["king_activity"] is king_activity_term
 
     assert evaluator.weights.material_pst == 1.0
     assert evaluator.weights.mobility == 1.0
@@ -336,6 +339,7 @@ def test_default_evaluator_enables_all_eight_terms() -> None:
     assert evaluator.weights.passed_pawn == 1.0
     assert evaluator.weights.bishop_pair == 1.0
     assert evaluator.weights.rook_open_file == 1.0
+    assert evaluator.weights.king_activity == 1.0
 
 
 # --- mobility_term ------------------------------------------------------
